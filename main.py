@@ -21,7 +21,7 @@ async def health():
     return {"status": "healthy"}
 
 
-@app.post("/webhook/{secret}")
+@app.post("/webhook")
 async def webhook(secret: str, request: Request):
 
     if not WEBHOOK_SECRET:
