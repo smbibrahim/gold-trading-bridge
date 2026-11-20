@@ -1,4 +1,3 @@
-
 import os
 import time
 import hmac
@@ -10,13 +9,22 @@ from urllib.parse import urlencode
 class BinanceClient:
     BASE_URL = "https://demo-fapi.binance.com"
 
-    def __init__(self, api_key=None, api_secret=None):
-        self.api_key = api_key or os.getenv("BINANCE_API_KEY_1")
-        self.api_secret = api_secret or os.getenv("BINANCE_API_SECRET_1")
+    def __init__(self, account_number=1):
+        self.account_number = account_number
+
+        self.api_key = os.getenv(
+            f"BINANCE_API_KEY_{account_number}"
+        )
+        self.api_secret = os.getenv(
+            f"BINANCE_API_SECRET_{account_number}"
+        )
+
         self.connected = False
 
         if not self.api_key or not self.api_secret:
-            raise ValueError("Binance Account 1 credentials missing")
+            raise ValueError(
+                f"Binance Account {account_number} credentials missing"
+            )
 
         self.session = requests.Session()
         self.session.headers.update({
@@ -24,10 +32,11 @@ class BinanceClient:
         })
 
     def _signed_request(self, method, endpoint, params=None):
-        params = params or {}
+        params = dict(params or {})
         params["timestamp"] = int(time.time() * 1000)
 
         query = urlencode(params)
+
         signature = hmac.new(
             self.api_secret.encode("utf-8"),
             query.encode("utf-8"),
@@ -36,11 +45,9 @@ class BinanceClient:
 
         params["signature"] = signature
 
-        url = self.BASE_URL + endpoint
-
         response = self.session.request(
             method,
-            url,
+            self.BASE_URL + endpoint,
             params=params if method == "GET" else None,
             data=params if method != "GET" else None,
             timeout=15
@@ -60,9 +67,11 @@ class BinanceClient:
 
             return {
                 "status": "connected",
-                "account": "Account 1",
+                "account": f"Account {self.account_number}",
                 "can_trade": result.get("canTrade"),
-                "available_balance": result.get("availableBalance")
+                "available_balance": result.get(
+                    "availableBalance"
+                )
             }
 
         except Exception as e:
@@ -70,6 +79,7 @@ class BinanceClient:
 
             return {
                 "status": "connection_failed",
+                "account": f"Account {self.account_number}",
                 "error": str(e)
             }
 
@@ -78,6 +88,7 @@ class BinanceClient:
             self.BASE_URL + "/fapi/v1/exchangeInfo",
             timeout=15
         )
+
         response.raise_for_status()
         return response.json()
 
@@ -104,7 +115,13 @@ class BinanceClient:
             }
         )
 
-    def protective_order(self, symbol, side, order_type, trigger_price):
+    def protective_order(
+        self,
+        symbol,
+        side,
+        order_type,
+        trigger_price
+    ):
         return self._signed_request(
             "POST",
             "/fapi/v1/algoOrder",
