@@ -87,6 +87,10 @@ class BinanceClient:
         return self._signed_request("POST", "/fapi/v1/algoOrder", params)
     def cancel_algo_order(self, symbol, algo_id):
         return self._signed_request("DELETE", "/fapi/v1/algoOrder", {"symbol": symbol, "algoId": int(algo_id)})
+    def get_open_algo_orders(self, symbol):
+        return self._signed_request("GET", "/fapi/v1/algoOpenOrders", {"symbol": symbol})
+    def get_order(self, symbol, order_id):
+        return self._signed_request("GET", "/fapi/v1/order", {"symbol": symbol, "orderId": int(order_id)})
     def get_open_position(self, symbol):
         positions=self.get_position_risk(symbol)
         if isinstance(positions, list):
