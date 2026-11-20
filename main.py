@@ -84,6 +84,51 @@ async def test_connections():
     }
 
 
+@app.get("/account-config")
+async def account_config():
+    results = []
+
+    for account_number in (1, 2):
+        try:
+            client = BinanceClient(account_number)
+
+            position_mode = client.get_position_mode()
+            position_risk = client.get_position_risk("XAUUSDT")
+            leverage_brackets = client.get_leverage_brackets("XAUUSDT")
+
+            # Return limited account configuration information.
+            # Do not expose full position details publicly.
+
+            current_leverage = []
+
+            if isinstance(position_risk, list):
+                for position in position_risk:
+                    if position.get("symbol") == "XAUUSDT":
+                        current_leverage.append(
+                            position.get("leverage")
+                        )
+
+            results.append({
+                "account": f"Account {account_number}",
+                "status": "success",
+                "position_mode": position_mode,
+                "current_leverage": current_leverage,
+                "leverage_brackets": leverage_brackets
+            })
+
+        except Exception as e:
+            results.append({
+                "account": f"Account {account_number}",
+                "status": "error",
+                "error": str(e)
+            })
+
+    return {
+        "results": results,
+        "execution_enabled": False
+    }
+
+
 @app.get("/validate-contract")
 async def validate_contract(
     symbol: str = "XAUUSDT",
