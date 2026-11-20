@@ -1,0 +1,17 @@
+name: Keep Render Bridge Alive
+
+on:
+  schedule:
+    - cron: '*/5 * * * *'
+  workflow_dispatch:
+
+jobs:
+  ping-render:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Send harmless keep-alive payload to Render webhook
+        run: |
+          curl --fail --silent --show-error --max-time 20 \
+            -X POST https://gold-trading-bridge-sg.onrender.com/webhook \
+            -H 'Content-Type: application/json' \
+            -d '{"type":"KEEPALIVE","source":"github-actions"}'
