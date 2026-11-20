@@ -23,10 +23,13 @@ class BinanceAPIError(RuntimeError):
 
 
 class BinanceClient:
+    # HARD-LOCKED TO BINANCE USD-M DEMO FUTURES
     BASE_URL = "https://demo-fapi.binance.com"
 
     def __init__(self, account_number=1):
         self.account_number = int(account_number)
+        if self.account_number not in (1, 2):
+            raise ValueError("Only Account 1 or Account 2 is supported")
         self.api_key = os.getenv(f"BINANCE_API_KEY_{self.account_number}")
         self.api_secret = os.getenv(f"BINANCE_API_SECRET_{self.account_number}")
         if not self.api_key or not self.api_secret:
@@ -38,15 +41,17 @@ class BinanceClient:
         params = dict(params or {})
         safe_params = dict(params)
         params["timestamp"] = int(time.time() * 1000)
+        params.setdefault("recvWindow", 5000)
         query = urlencode(params)
         params["signature"] = hmac.new(
             self.api_secret.encode("utf-8"), query.encode("utf-8"), hashlib.sha256
         ).hexdigest()
         method = method.upper()
-        if method == "GET":
-            response = self.session.request(method, self.BASE_URL + endpoint, params=params, timeout=15)
+        url = self.BASE_URL + endpoint
+        if method in ("GET", "DELETE"):
+            response = self.session.request(method, url, params=params, timeout=15)
         else:
-            response = self.session.request(method, self.BASE_URL + endpoint, data=params, timeout=15)
+            response = self.session.request(method, url, data=params, timeout=15)
 
         if not response.ok:
             try:
@@ -59,6 +64,7 @@ class BinanceClient:
         except Exception as exc:
             raise RuntimeError(f"Account {self.account_number}: JSON parsing failed at {endpoint}: {exc}")
 
+    # READ-ONLY / DIAGNOSTIC
     def test_connection(self):
         result = self.get_account()
         return {
@@ -93,5 +99,83 @@ class BinanceClient:
                     return position
         return None
 
-    # Order-placement and close methods are intentionally not exposed in this release.
-    # This revision is diagnostic/validation-only and contains no trade execution path.
+    def get_mark_price(self, symbol):
+        response = self.session.get(self.BASE_URL + "/fapi/v1/ticker/price", params={"symbol": symbol}, timeout=15)
+        response.raise_for_status()
+        return response.json()
+
+    # EXECUTION — DEMO ONLY (base URL is hard-locked above)
+    def set_leverage(self, symbol, leverage):
+        return self._signed_request("POST", "/fapi/v1/leverage", {"symbol": symbol, "leverage": int(leverage)})
+
+    def market_entry(self, symbol, side, quantity, client_order_id=None):
+        params = {
+            "symbol": symbol,
+            "side": side.upper(),
+            "type": "MARKET",
+            "quantity": str(quantity),
+            "newOrderRespType": "RESULT",
+        }
+        if client_order_id:
+            params["newClientOrderId"] = str(client_order_id)[:36]
+        return self._signed_request("POST", "/fapi/v1/order", params)
+
+    def query_order(self, symbol, order_id=None, client_order_id=None):
+        params = {"symbol": symbol}
+        if order_id is not None:
+            params["orderId"] = order_id
+        elif client_order_id:
+            params["origClientOrderId"] = client_order_id
+        else:
+            raise ValueError("order_id or client_order_id is required")
+        return self._signed_request("GET", "/fapi/v1/order", params)
+
+    def place_close_all_algo(self, symbol, closing_side, order_type, trigger_price, working_type="CONTRACT_PRICE"):
+        if order_type not in ("STOP_MARKET", "TAKE_PROFIT_MARKET"):
+            raise ValueError("Only STOP_MARKET and TAKE_PROFIT_MARKET are supported")
+        return self._signed_request("POST", "/fapi/v1/algoOrder", {
+            "algoType": "CONDITIONAL",
+            "symbol": symbol,
+            "side": closing_side.upper(),
+            "type": order_type,
+            "triggerPrice": str(trigger_price),
+            "closePosition": "true",
+            "workingType": working_type,
+            "priceProtect": "false",
+        })
+
+    def get_open_algo_orders(self, symbol):
+        return self._signed_request("GET", "/fapi/v1/openAlgoOrders", {"symbol": symbol})
+
+    def query_algo_order(self, symbol, algo_id):
+        return self._signed_request("GET", "/fapi/v1/algoOrder", {"symbol": symbol, "algoId": algo_id})
+
+    def cancel_algo_order(self, symbol, algo_id):
+        return self._signed_request("DELETE", "/fapi/v1/algoOrder", {"symbol": symbol, "algoId": algo_id})
+
+    def cancel_all_open_algo_orders(self, symbol):
+        return self._signed_request("DELETE", "/fapi/v1/algoOpenOrders", {"symbol": symbol})
+
+    def close_position_market(self, symbol):
+        position = self.get_open_position(symbol)
+        if not position:
+            return {"status": "already_flat", "confirmed_flat": True}
+        amount = float(position.get("positionAmt", 0))
+        side = "SELL" if amount > 0 else "BUY"
+        quantity = abs(amount)
+        result = self._signed_request("POST", "/fapi/v1/order", {
+            "symbol": symbol,
+            "side": side,
+            "type": "MARKET",
+            "quantity": str(quantity),
+            "reduceOnly": "true",
+            "newOrderRespType": "RESULT",
+        })
+        # Confirm position state after close request.
+        time.sleep(0.5)
+        confirm = self.get_open_position(symbol)
+        return {
+            "close_order": result,
+            "confirmed_flat": confirm is None,
+            "remaining_position": confirm,
+        }
