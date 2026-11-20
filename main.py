@@ -330,6 +330,45 @@ def get_account_snapshot(client, symbol):
 # PRE-TRADE VALIDATION ENGINE
 # =========================================================
 
+def confirm_position_with_retries(client, symbol, attempts=5, delay_seconds=1.0):
+    """Read-only position confirmation with bounded retries after entry."""
+    last_error = None
+    for attempt in range(1, attempts + 1):
+        try:
+            position = client.get_open_position(symbol)
+            if position and abs(float(position.get("positionAmt", 0))) > 0:
+                return position, {"confirmed": True, "attempts": attempt}
+        except Exception as exc:
+            last_error = str(exc)
+        if attempt < attempts:
+            time.sleep(delay_seconds)
+    return None, {"confirmed": False, "attempts": attempts, "last_error": last_error}
+
+
+def verify_protective_algos(client, symbol, sl_order, tp_order, sl_price, tp_price, attempts=3, delay_seconds=1.0):
+    """Confirm both submitted conditional orders appear in Binance open algo orders."""
+    expected_ids = {
+        str(sl_order.get("algoId")) if isinstance(sl_order, dict) and sl_order.get("algoId") is not None else None,
+        str(tp_order.get("algoId")) if isinstance(tp_order, dict) and tp_order.get("algoId") is not None else None,
+    }
+    expected_ids.discard(None)
+    last_snapshot = None
+    for attempt in range(1, attempts + 1):
+        orders = client.get_open_algo_orders(symbol)
+        last_snapshot = orders
+        if isinstance(orders, dict):
+            orders = orders.get("orders", orders.get("data", []))
+        if isinstance(orders, list):
+            found_ids = {str(o.get("algoId")) for o in orders if isinstance(o, dict) and o.get("algoId") is not None}
+            ids_verified = bool(expected_ids) and expected_ids.issubset(found_ids)
+            # ID verification is authoritative for the orders just submitted.
+            if ids_verified:
+                return {"verified": True, "attempts": attempt, "algo_ids": sorted(expected_ids)}
+        if attempt < attempts:
+            time.sleep(delay_seconds)
+    return {"verified": False, "attempts": attempts, "expected_algo_ids": sorted(expected_ids), "last_snapshot": last_snapshot}
+
+
 def validate_signal(signal, account_number=1):
 
     results = {
@@ -1225,11 +1264,30 @@ def process_demo_signal(signal, fingerprint):
             entry_order = client.place_market_order(TARGET_SYMBOL, entry_side, signal["quantity"])
             item["entry_order"] = entry_order
 
-            # Confirm position from Binance and use actual fill/position values.
-            position = client.get_open_position(TARGET_SYMBOL)
-            if not position or abs(float(position.get("positionAmt", 0))) <= 0:
-                item["status"] = "entry_not_confirmed"
-                item["reason"] = "Market order response received, but live position snapshot did not confirm exposure."
+            # Confirm the entry with bounded retries. An uncertain entry is not assumed flat.
+            position, confirmation = confirm_position_with_retries(client, TARGET_SYMBOL)
+            item["entry_confirmation_retry"] = confirmation
+            if not position:
+                item["status"] = "CRITICAL_entry_uncertain_recovery_required"
+                item["reason"] = "Entry response received but position was not confirmed after retries; do not assume the account is flat."
+                # If Binance returned an order ID, query its state before ending recovery.
+                order_id = entry_order.get("orderId") if isinstance(entry_order, dict) else None
+                if order_id is not None:
+                    try:
+                        item["entry_order_status"] = client.get_order(TARGET_SYMBOL, order_id)
+                    except Exception as order_query_error:
+                        item["entry_order_query_error"] = str(order_query_error)
+                # One additional position read after order-state query; close any confirmed exposure.
+                try:
+                    recovery_position = client.get_open_position(TARGET_SYMBOL)
+                    if recovery_position and abs(float(recovery_position.get("positionAmt", 0))) > 0:
+                        recovery_amt = float(recovery_position.get("positionAmt", 0))
+                        recovery_side = "SELL" if recovery_amt > 0 else "BUY"
+                        item["recovery_position"] = recovery_position
+                        item["recovery_close_attempt"] = client.close_position_market(TARGET_SYMBOL, recovery_side)
+                        item["status"] = "CRITICAL_uncertain_entry_close_attempted"
+                except Exception as recovery_error:
+                    item["recovery_error"] = str(recovery_error)
                 results.append(item)
                 continue
 
@@ -1286,7 +1344,13 @@ def process_demo_signal(signal, fingerprint):
                 )
                 placed_protection.append(tp_order)
                 item["take_profit_order"] = tp_order
-                item["status"] = "demo_trade_open_with_protection"
+                protection_verification = verify_protective_algos(
+                    client, TARGET_SYMBOL, sl_order, tp_order, signal["sl"], signal["tp"]
+                )
+                item["protection_verification"] = protection_verification
+                if not protection_verification.get("verified"):
+                    raise RuntimeError("Both protective Algo orders could not be verified as open on Binance")
+                item["status"] = "demo_trade_open_with_verified_protection"
                 any_completed = True
 
             except Exception as protection_error:
