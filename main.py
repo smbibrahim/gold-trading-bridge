@@ -1,10 +1,13 @@
 import re
+import requests
 from fastapi import FastAPI, Request
 from fastapi.responses import JSONResponse
 
 from binance_client import BinanceClient
 
 app = FastAPI(title="Gold Trading Bridge")
+
+BINANCE_DEMO_URL = "https://demo-fapi.binance.com"
 
 
 @app.get("/")
@@ -19,6 +22,42 @@ async def home():
 @app.get("/health")
 async def health():
     return {"status": "healthy"}
+
+
+@app.get("/diagnostic")
+async def diagnostic():
+    endpoints = {
+        "ping": "/fapi/v1/ping",
+        "time": "/fapi/v1/time"
+    }
+
+    results = {}
+
+    for name, endpoint in endpoints.items():
+        try:
+            response = requests.get(
+                BINANCE_DEMO_URL + endpoint,
+                timeout=15
+            )
+
+            results[name] = {
+                "http_status": response.status_code,
+                "success": response.ok,
+                "response": response.text[:500]
+            }
+
+        except Exception as e:
+            results[name] = {
+                "success": False,
+                "error": str(e)
+            }
+
+    return {
+        "service": "Binance Futures Demo Diagnostic",
+        "endpoint": BINANCE_DEMO_URL,
+        "results": results,
+        "execution_enabled": False
+    }
 
 
 @app.get("/test-connections")
