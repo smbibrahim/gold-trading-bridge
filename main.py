@@ -1,7 +1,10 @@
-
 import os
 import json
 import re
+import time
+import hashlib
+import logging
+
 import requests
 
 from fastapi import FastAPI, Request
@@ -10,176 +13,76 @@ from fastapi.responses import JSONResponse
 from binance_client import BinanceClient
 
 
-app = FastAPI(title="Gold Trading Bridge")
-
+app = FastAPI(title="Gold Trading Bridge - Pre-Trade Validation")
 
 BINANCE_BASE_URL = "https://demo-fapi.binance.com"
 EXECUTION_ENABLED = False
+TARGET_SYMBOL = "XAUUSDT"
+
+RISK_LIMIT_PERCENT = float(
+    os.getenv("RISK_LIMIT_PERCENT", "2")
+)
+
+# In-memory duplicate protection.
+# This resets when Render restarts.
+SEEN_SIGNALS = {}
+DUPLICATE_WINDOW_SECONDS = 300
+
+logging.basicConfig(level=logging.INFO)
+logger = logging.getLogger("gold_bridge")
 
 
 # =========================================================
-# BASIC ROUTES
+# UTILITIES
 # =========================================================
 
-@app.get("/")
-def home():
-    return {
-        "service": "Gold Trading Bridge",
-        "status": "running",
-        "execution_enabled": EXECUTION_ENABLED
-    }
+def log_event(event):
+    logger.info(json.dumps(event, default=str))
 
 
-@app.get("/health")
-def health():
-    return {
-        "status": "healthy",
-        "execution_enabled": EXECUTION_ENABLED
-    }
+def clean_number(value):
+    return float(str(value).replace(",", "").strip())
 
 
-# =========================================================
-# PUBLIC BINANCE DIAGNOSTIC
-# =========================================================
+def normalize_symbol(symbol):
+    symbol = str(symbol).upper().strip()
 
-@app.get("/diagnostic")
-def diagnostic():
-    results = {}
+    if symbol in ("XAUUSDT.P", "XAUUSDT"):
+        return "XAUUSDT"
 
-    try:
-        response = requests.get(
-            BINANCE_BASE_URL + "/fapi/v1/ping",
-            timeout=15
-        )
-
-        results["ping"] = {
-            "http_status": response.status_code,
-            "success": response.status_code == 200,
-            "response": response.text
-        }
-
-    except Exception as e:
-        results["ping"] = {
-            "success": False,
-            "error": str(e)
-        }
-
-    try:
-        response = requests.get(
-            BINANCE_BASE_URL + "/fapi/v1/time",
-            timeout=15
-        )
-
-        results["time"] = {
-            "http_status": response.status_code,
-            "success": response.status_code == 200,
-            "response": response.text
-        }
-
-    except Exception as e:
-        results["time"] = {
-            "success": False,
-            "error": str(e)
-        }
-
-    return {
-        "service": "Binance Futures Demo Diagnostic",
-        "endpoint": BINANCE_BASE_URL,
-        "results": results,
-        "execution_enabled": EXECUTION_ENABLED
-    }
+    return None
 
 
-# =========================================================
-# ACCOUNT CONNECTION TEST
-# =========================================================
+def signal_fingerprint(signal):
+    raw = json.dumps(
+        signal,
+        sort_keys=True
+    )
 
-@app.get("/test-connections")
-def test_connections():
-
-    results = []
-
-    for account_number in (1, 2):
-
-        try:
-            client = BinanceClient(account_number)
-
-            result = client.test_connection()
-
-            results.append(result)
-
-        except Exception as e:
-
-            results.append({
-                "account": f"Account {account_number}",
-                "status": "error",
-                "error": str(e)
-            })
-
-    return {
-        "results": results,
-        "execution_enabled": EXECUTION_ENABLED
-    }
+    return hashlib.sha256(
+        raw.encode("utf-8")
+    ).hexdigest()
 
 
-# =========================================================
-# ACCOUNT CONFIGURATION
-# READ ONLY
-# =========================================================
+def check_duplicate(signal):
+    now = time.time()
 
-@app.get("/account-config")
-def account_config():
+    expired = [
+        key for key, timestamp in SEEN_SIGNALS.items()
+        if now - timestamp > DUPLICATE_WINDOW_SECONDS
+    ]
 
-    results = []
+    for key in expired:
+        SEEN_SIGNALS.pop(key, None)
 
-    for account_number in (1, 2):
+    fingerprint = signal_fingerprint(signal)
 
-        try:
+    if fingerprint in SEEN_SIGNALS:
+        return True
 
-            client = BinanceClient(account_number)
+    SEEN_SIGNALS[fingerprint] = now
 
-            position_mode = client.get_position_mode()
-
-            position_risk = client.get_position_risk(
-                "XAUUSDT"
-            )
-
-            leverage_brackets = client.get_leverage_brackets(
-                "XAUUSDT"
-            )
-
-            current_leverage = []
-
-            if isinstance(position_risk, list):
-
-                for position in position_risk:
-
-                    if position.get("symbol") == "XAUUSDT":
-
-                        current_leverage.append(
-                            position.get("leverage")
-                        )
-
-            results.append({
-                "account": f"Account {account_number}",
-                "status": "success",
-                "position_mode": position_mode,
-                "current_leverage": current_leverage,
-                "leverage_brackets": leverage_brackets
-            })
-
-        except Exception as e:
-
-            results.append({
-                "account": f"Account {account_number}",
-                "status": "error",
-                "error": str(e)
-            })
-
-    return {
-        "results": results,
-        "execution_enabled": EXECUTION_ENABLED
-    }
+    return False
 
 
 # =========================================================
@@ -190,9 +93,7 @@ def parse_signal(message):
 
     try:
 
-        # JSON format support
         if isinstance(message, dict):
-
             data = message
 
         else:
@@ -200,218 +101,154 @@ def parse_signal(message):
             message = str(message).strip()
 
             try:
-
                 data = json.loads(message)
 
             except json.JSONDecodeError:
 
                 data = {}
 
-                lines = message.splitlines()
-
-                for line in lines:
+                for line in message.splitlines():
 
                     line = line.strip()
 
-                    if not line:
+                    if ":" not in line:
                         continue
 
-                    if ":" in line:
+                    key, value = line.split(":", 1)
 
-                        key, value = line.split(
-                            ":",
-                            1
-                        )
+                    data[key.strip()] = value.strip()
 
-                        data[key.strip()] = value.strip()
-
-        if not data:
-
-            return None, "Unable to parse signal"
-
-        # Normalize keys
         normalized = {}
 
         for key, value in data.items():
 
             normalized[
-                str(key).strip().lower().replace(" ", "_")
+                str(key).lower().strip().replace(" ", "_")
             ] = value
 
-        # Direction
         side_value = (
             normalized.get("side")
             or normalized.get("direction")
             or normalized.get("signal")
         )
 
-        if side_value is None:
-
+        if not side_value:
             return None, "Missing direction"
 
         side_value = str(side_value).upper()
 
         if "LONG" in side_value:
-
             side = "LONG"
 
         elif "SHORT" in side_value:
-
             side = "SHORT"
 
         else:
-
             return None, "Invalid direction"
 
-        # Symbol
         symbol = (
             normalized.get("symbol")
             or normalized.get("pair")
         )
 
         if not symbol:
-
             return None, "Missing symbol"
 
-        symbol = str(symbol).upper().strip()
-
-        # Exchange
         exchange = normalized.get(
             "exchange",
             "BINANCE FUTURES"
         )
 
-        # Timeframe
         timeframe = (
             normalized.get("timeframe")
             or normalized.get("interval")
             or "UNKNOWN"
         )
 
-        # Leverage
         leverage_value = normalized.get("leverage")
 
         if leverage_value is None:
-
             return None, "Missing leverage"
-
-        leverage_text = str(leverage_value)
 
         leverage_match = re.search(
             r"\d+",
-            leverage_text
+            str(leverage_value)
         )
 
         if not leverage_match:
-
             return None, "Invalid leverage"
 
-        leverage = int(
-            leverage_match.group()
-        )
+        leverage = int(leverage_match.group())
 
         if leverage < 1 or leverage > 125:
+            return None, "Leverage out of range"
 
-            return None, "Leverage must be between 1 and 125"
-
-        # Quantity
         quantity_value = (
             normalized.get("quantity")
             or normalized.get("qty")
         )
 
         if quantity_value is None:
-
             return None, "Missing quantity"
 
-        quantity = float(quantity_value)
+        quantity = clean_number(quantity_value)
 
-        if quantity <= 0:
-
-            return None, "Quantity must be greater than zero"
-
-        # Entry
         entry_value = (
             normalized.get("entry_price")
             or normalized.get("entry")
         )
 
-        if entry_value is None:
-
-            return None, "Missing entry price"
-
-        entry = float(entry_value)
-
-        # TP
         tp_value = (
             normalized.get("take_profit")
             or normalized.get("tp")
             or normalized.get("tp_price")
         )
 
-        if tp_value is None:
-
-            return None, "Missing take profit"
-
-        tp = float(tp_value)
-
-        # SL
         sl_value = (
             normalized.get("stop_loss")
             or normalized.get("sl")
             or normalized.get("sl_price")
         )
 
-        if sl_value is None:
+        if entry_value is None:
+            return None, "Missing entry"
 
+        if tp_value is None:
+            return None, "Missing take profit"
+
+        if sl_value is None:
             return None, "Missing stop loss"
 
-        sl = float(sl_value)
+        entry = clean_number(entry_value)
+        tp = clean_number(tp_value)
+        sl = clean_number(sl_value)
 
-        # Basic numeric validation
+        if quantity <= 0:
+            return None, "Quantity must be positive"
+
         if entry <= 0 or tp <= 0 or sl <= 0:
+            return None, "Prices must be positive"
 
-            return None, "Prices must be greater than zero"
-
-        # Directional validation
         if side == "LONG":
 
             if not sl < entry < tp:
-
-                return None, (
-                    "Invalid LONG price relationship: "
-                    "SL < Entry < TP required"
-                )
+                return None, "Invalid LONG price relationship"
 
         if side == "SHORT":
 
             if not tp < entry < sl:
-
-                return None, (
-                    "Invalid SHORT price relationship: "
-                    "TP < Entry < SL required"
-                )
+                return None, "Invalid SHORT price relationship"
 
         signal = {
-
             "side": side,
-
-            "symbol": symbol,
-
+            "symbol": str(symbol).upper().strip(),
             "exchange": str(exchange),
-
             "timeframe": str(timeframe),
-
             "leverage": leverage,
-
             "quantity": quantity,
-
             "entry": entry,
-
             "tp": tp,
-
             "sl": sl
-
         }
 
         return signal, None
@@ -422,8 +259,706 @@ def parse_signal(message):
 
 
 # =========================================================
-# CONTRACT VALIDATION
+# CONTRACT INFORMATION
 # =========================================================
+
+def get_symbol_info(client, symbol):
+
+    exchange_info = client.get_exchange_info()
+
+    for item in exchange_info.get("symbols", []):
+
+        if item.get("symbol") == symbol:
+            return item
+
+    return None
+
+
+def get_filters(symbol_data):
+
+    result = {}
+
+    for item in symbol_data.get("filters", []):
+
+        result[item["filterType"]] = item
+
+    return result
+
+
+def check_step(value, step):
+
+    step = float(step)
+
+    if step <= 0:
+        return False
+
+    return abs(
+        round(value / step) * step - value
+    ) < 1e-8
+
+
+# =========================================================
+# ACCOUNT VALIDATION
+# =========================================================
+
+def get_account_snapshot(client, symbol):
+
+    account = client.get_account()
+
+    positions = client.get_position_risk(symbol)
+
+    active_positions = []
+
+    if isinstance(positions, list):
+
+        for position in positions:
+
+            if position.get("symbol") != symbol:
+                continue
+
+            position_amt = float(
+                position.get("positionAmt", 0)
+            )
+
+            if abs(position_amt) > 0:
+                active_positions.append(position)
+
+    return account, active_positions
+
+
+# =========================================================
+# PRE-TRADE VALIDATION ENGINE
+# =========================================================
+
+def validate_signal(signal, account_number=1):
+
+    results = {
+        "account": f"Account {account_number}",
+        "checks": {},
+        "reasons": [],
+        "ready": False
+    }
+
+    try:
+
+        client = BinanceClient(account_number)
+
+        # -------------------------------------------------
+        # SYMBOL
+        # -------------------------------------------------
+
+        binance_symbol = normalize_symbol(
+            signal["symbol"]
+        )
+
+        results["binance_symbol"] = binance_symbol
+
+        if not binance_symbol:
+
+            results["reasons"].append(
+                "Unsupported symbol"
+            )
+
+            return results
+
+        # -------------------------------------------------
+        # CONTRACT
+        # -------------------------------------------------
+
+        symbol_data = get_symbol_info(
+            client,
+            binance_symbol
+        )
+
+        if not symbol_data:
+
+            results["reasons"].append(
+                "Contract not found"
+            )
+
+            return results
+
+        filters = get_filters(symbol_data)
+
+        lot = filters.get("LOT_SIZE", {})
+        market_lot = filters.get("MARKET_LOT_SIZE", {})
+        price_filter = filters.get("PRICE_FILTER", {})
+        min_notional_filter = filters.get("MIN_NOTIONAL", {})
+
+        quantity = signal["quantity"]
+        entry = signal["entry"]
+        leverage = signal["leverage"]
+
+        notional = quantity * entry
+
+        lot_min = float(lot.get("minQty", 0))
+        lot_max = float(lot.get("maxQty", 0))
+        lot_step = float(lot.get("stepSize", 0))
+
+        market_min = float(market_lot.get("minQty", 0))
+        market_max = float(market_lot.get("maxQty", 0))
+        market_step = float(market_lot.get("stepSize", 0))
+
+        price_min = float(
+            price_filter.get("minPrice", 0)
+        )
+
+        price_max = float(
+            price_filter.get("maxPrice", 0)
+        )
+
+        tick = float(
+            price_filter.get("tickSize", 0)
+        )
+
+        min_notional = float(
+            min_notional_filter.get(
+                "notional",
+                min_notional_filter.get("minNotional", 0)
+            )
+        )
+
+        contract_trading = (
+            symbol_data.get("status") == "TRADING"
+        )
+
+        lot_valid = (
+            lot_min <= quantity <= lot_max
+            and check_step(quantity, lot_step)
+        )
+
+        market_lot_valid = (
+            market_min <= quantity <= market_max
+            and check_step(quantity, market_step)
+        )
+
+        price_valid = (
+            price_min <= entry <= price_max
+            and check_step(entry, tick)
+            and check_step(signal["tp"], tick)
+            and check_step(signal["sl"], tick)
+        )
+
+        notional_valid = notional >= min_notional
+
+        results["checks"]["contract_trading"] = (
+            contract_trading
+        )
+
+        results["checks"]["lot_size_valid"] = (
+            lot_valid
+        )
+
+        results["checks"]["market_lot_size_valid"] = (
+            market_lot_valid
+        )
+
+        results["checks"]["price_precision_valid"] = (
+            price_valid
+        )
+
+        results["checks"]["minimum_notional_valid"] = (
+            notional_valid
+        )
+
+        if not contract_trading:
+            results["reasons"].append(
+                "Contract is not trading"
+            )
+
+        if not lot_valid:
+            results["reasons"].append(
+                "LOT_SIZE validation failed"
+            )
+
+        if not market_lot_valid:
+            results["reasons"].append(
+                "MARKET_LOT_SIZE validation failed"
+            )
+
+        if not price_valid:
+            results["reasons"].append(
+                "Price precision/filter validation failed"
+            )
+
+        if not notional_valid:
+            results["reasons"].append(
+                "Minimum notional validation failed"
+            )
+
+        # -------------------------------------------------
+        # ACCOUNT SNAPSHOT
+        # -------------------------------------------------
+
+        account, active_positions = get_account_snapshot(
+            client,
+            binance_symbol
+        )
+
+        available_balance = float(
+            account.get("availableBalance", 0)
+        )
+
+        total_wallet_balance = float(
+            account.get("totalWalletBalance", 0)
+        )
+
+        total_margin_balance = float(
+            account.get("totalMarginBalance", 0)
+        )
+
+        results["account_balance"] = {
+            "available_balance": available_balance,
+            "wallet_balance": total_wallet_balance,
+            "margin_balance": total_margin_balance
+        }
+
+        results["checks"]["account_connected"] = (
+            account.get("canTrade", False)
+        )
+
+        if not account.get("canTrade", False):
+            results["reasons"].append(
+                "Account trading permission is unavailable"
+            )
+
+        # -------------------------------------------------
+        # EXISTING POSITION CHECK
+        # -------------------------------------------------
+
+        results["existing_positions"] = len(
+            active_positions
+        )
+
+        position_clear = (
+            len(active_positions) == 0
+        )
+
+        results["checks"]["no_existing_position"] = (
+            position_clear
+        )
+
+        if not position_clear:
+            results["reasons"].append(
+                "Existing XAUUSDT position detected"
+            )
+
+        # -------------------------------------------------
+        # LEVERAGE BRACKET CHECK
+        # -------------------------------------------------
+
+        bracket_data = client.get_leverage_brackets(
+            binance_symbol
+        )
+
+        bracket_list = []
+
+        if isinstance(bracket_data, list):
+
+            for item in bracket_data:
+
+                if item.get("symbol") == binance_symbol:
+
+                    bracket_list = item.get(
+                        "brackets",
+                        []
+                    )
+
+                    break
+
+        else:
+
+            bracket_list = bracket_data.get(
+                "brackets",
+                []
+            )
+
+        applicable_bracket = None
+
+        for bracket in bracket_list:
+
+            floor = float(
+                bracket.get("notionalFloor", 0)
+            )
+
+            cap = float(
+                bracket.get("notionalCap", 0)
+            )
+
+            if floor <= notional <= cap:
+
+                applicable_bracket = bracket
+
+                break
+
+        maximum_bracket_leverage = (
+            int(applicable_bracket.get("initialLeverage"))
+            if applicable_bracket
+            else None
+        )
+
+        bracket_leverage_valid = (
+            maximum_bracket_leverage is not None
+            and leverage <= maximum_bracket_leverage
+        )
+
+        results["leverage_bracket"] = {
+            "requested_leverage": leverage,
+            "maximum_leverage_for_notional": (
+                maximum_bracket_leverage
+            )
+        }
+
+        results["checks"]["bracket_leverage_valid"] = (
+            bracket_leverage_valid
+        )
+
+        if not bracket_leverage_valid:
+
+            results["reasons"].append(
+                "Requested leverage exceeds applicable bracket "
+                "or bracket could not be determined"
+            )
+
+        # -------------------------------------------------
+        # MARGIN ESTIMATE
+        # -------------------------------------------------
+
+        estimated_initial_margin = (
+            notional / leverage
+        )
+
+        margin_valid = (
+            estimated_initial_margin
+            <= available_balance
+        )
+
+        results["margin_estimate"] = {
+            "notional": notional,
+            "requested_leverage": leverage,
+            "estimated_initial_margin": (
+                estimated_initial_margin
+            ),
+            "available_balance": available_balance
+        }
+
+        results["checks"]["margin_available"] = (
+            margin_valid
+        )
+
+        if not margin_valid:
+
+            results["reasons"].append(
+                "Estimated initial margin exceeds available balance"
+            )
+
+        # -------------------------------------------------
+        # RISK ESTIMATE
+        # -------------------------------------------------
+
+        stop_distance = abs(
+            entry - signal["sl"]
+        )
+
+        estimated_loss = (
+            stop_distance * quantity
+        )
+
+        risk_percent = (
+            estimated_loss / total_wallet_balance * 100
+            if total_wallet_balance > 0
+            else float("inf")
+        )
+
+        risk_valid = (
+            total_wallet_balance > 0
+            and risk_percent <= RISK_LIMIT_PERCENT
+        )
+
+        results["risk_estimate"] = {
+
+            "stop_distance": stop_distance,
+
+            "estimated_loss_at_stop": (
+                estimated_loss
+            ),
+
+            "wallet_balance": (
+                total_wallet_balance
+            ),
+
+            "estimated_risk_percent": (
+                risk_percent
+            ),
+
+            "risk_limit_percent": (
+                RISK_LIMIT_PERCENT
+            )
+
+        }
+
+        results["checks"]["risk_limit_valid"] = (
+            risk_valid
+        )
+
+        if not risk_valid:
+
+            results["reasons"].append(
+                "Estimated risk exceeds configured risk limit"
+            )
+
+        # -------------------------------------------------
+        # DUPLICATE CHECK
+        # -------------------------------------------------
+
+        results["checks"]["duplicate_signal"] = (
+            False
+        )
+
+        # -------------------------------------------------
+        # FINAL RESULT
+        # -------------------------------------------------
+
+        all_checks_passed = all(
+            results["checks"].values()
+        )
+
+        results["ready"] = all_checks_passed
+
+        results["status"] = (
+            "READY_FOR_LEVERAGE_CONFIGURATION"
+            if all_checks_passed
+            else "REJECTED"
+        )
+
+        results["execution_enabled"] = (
+            EXECUTION_ENABLED
+        )
+
+        return results
+
+    except Exception as e:
+
+        results["status"] = "ERROR"
+
+        results["reasons"].append(
+            str(e)
+        )
+
+        results["execution_enabled"] = (
+            EXECUTION_ENABLED
+        )
+
+        return results
+
+
+# =========================================================
+# ROUTES
+# =========================================================
+
+@app.get("/")
+def home():
+
+    return {
+
+        "service": "Gold Trading Bridge",
+
+        "status": "running",
+
+        "mode": "PRE-TRADE VALIDATION",
+
+        "execution_enabled": (
+            EXECUTION_ENABLED
+        )
+
+    }
+
+
+@app.get("/health")
+def health():
+
+    return {
+
+        "status": "healthy",
+
+        "execution_enabled": (
+            EXECUTION_ENABLED
+        )
+
+    }
+
+
+@app.get("/diagnostic")
+def diagnostic():
+
+    results = {}
+
+    for name, endpoint in (
+        ("ping", "/fapi/v1/ping"),
+        ("time", "/fapi/v1/time")
+    ):
+
+        try:
+
+            response = requests.get(
+                BINANCE_BASE_URL + endpoint,
+                timeout=15
+            )
+
+            results[name] = {
+
+                "http_status": (
+                    response.status_code
+                ),
+
+                "success": (
+                    response.status_code == 200
+                ),
+
+                "response": (
+                    response.text
+                )
+
+            }
+
+        except Exception as e:
+
+            results[name] = {
+
+                "success": False,
+
+                "error": str(e)
+
+            }
+
+    return {
+
+        "results": results,
+
+        "execution_enabled": (
+            EXECUTION_ENABLED
+        )
+
+    }
+
+
+@app.get("/test-connections")
+def test_connections():
+
+    results = []
+
+    for account_number in (1, 2):
+
+        try:
+
+            client = BinanceClient(
+                account_number
+            )
+
+            results.append(
+                client.test_connection()
+            )
+
+        except Exception as e:
+
+            results.append({
+
+                "account": (
+                    f"Account {account_number}"
+                ),
+
+                "status": "error",
+
+                "error": str(e)
+
+            })
+
+    return {
+
+        "results": results,
+
+        "execution_enabled": (
+            EXECUTION_ENABLED
+        )
+
+    }
+
+
+@app.get("/account-config")
+def account_config():
+
+    results = []
+
+    for account_number in (1, 2):
+
+        try:
+
+            client = BinanceClient(
+                account_number
+            )
+
+            mode = client.get_position_mode()
+
+            position_risk = client.get_position_risk(
+                TARGET_SYMBOL
+            )
+
+            brackets = client.get_leverage_brackets(
+                TARGET_SYMBOL
+            )
+
+            leverage = []
+
+            if isinstance(position_risk, list):
+
+                for position in position_risk:
+
+                    if position.get("symbol") == TARGET_SYMBOL:
+
+                        leverage.append(
+                            position.get("leverage")
+                        )
+
+            results.append({
+
+                "account": (
+                    f"Account {account_number}"
+                ),
+
+                "status": "success",
+
+                "position_mode": mode,
+
+                "current_leverage": leverage,
+
+                "leverage_brackets": brackets
+
+            })
+
+        except Exception as e:
+
+            results.append({
+
+                "account": (
+                    f"Account {account_number}"
+                ),
+
+                "status": "error",
+
+                "error": str(e)
+
+            })
+
+    return {
+
+        "results": results,
+
+        "execution_enabled": (
+            EXECUTION_ENABLED
+        )
+
+    }
+
 
 @app.get("/validate-contract")
 def validate_contract(
@@ -434,39 +969,35 @@ def validate_contract(
 
     try:
 
-        symbol = symbol.upper()
-
         client = BinanceClient(1)
 
-        exchange_info = client.get_exchange_info()
-
-        symbol_data = None
-
-        for item in exchange_info.get("symbols", []):
-
-            if item.get("symbol") == symbol:
-
-                symbol_data = item
-
-                break
+        symbol_data = get_symbol_info(
+            client,
+            symbol.upper()
+        )
 
         if not symbol_data:
 
             return {
+
                 "status": "rejected",
+
                 "reason": "Symbol not found",
-                "execution_enabled": EXECUTION_ENABLED
+
+                "execution_enabled": False
+
             }
 
-        filters = {}
+        filters = get_filters(
+            symbol_data
+        )
 
-        for item in symbol_data.get("filters", []):
+        lot = filters.get(
+            "LOT_SIZE",
+            {}
+        )
 
-            filters[item["filterType"]] = item
-
-        lot_size = filters.get("LOT_SIZE", {})
-
-        market_lot_size = filters.get(
+        market_lot = filters.get(
             "MARKET_LOT_SIZE",
             {}
         )
@@ -482,27 +1013,27 @@ def validate_contract(
         )
 
         min_qty = float(
-            lot_size.get("minQty", 0)
+            lot.get("minQty", 0)
         )
 
         max_qty = float(
-            lot_size.get("maxQty", 0)
+            lot.get("maxQty", 0)
         )
 
-        lot_step = float(
-            lot_size.get("stepSize", 0)
+        step = float(
+            lot.get("stepSize", 0)
         )
 
-        market_min_qty = float(
-            market_lot_size.get("minQty", 0)
+        market_min = float(
+            market_lot.get("minQty", 0)
         )
 
-        market_max_qty = float(
-            market_lot_size.get("maxQty", 0)
+        market_max = float(
+            market_lot.get("maxQty", 0)
         )
 
         market_step = float(
-            market_lot_size.get("stepSize", 0)
+            market_lot.get("stepSize", 0)
         )
 
         min_price = float(
@@ -513,7 +1044,7 @@ def validate_contract(
             price_filter.get("maxPrice", 0)
         )
 
-        tick_size = float(
+        tick = float(
             price_filter.get("tickSize", 0)
         )
 
@@ -533,34 +1064,22 @@ def validate_contract(
 
             "lot_size_valid":
                 min_qty <= quantity <= max_qty
-                and lot_step > 0
-                and abs(
-                    round(quantity / lot_step)
-                    * lot_step - quantity
-                ) < 1e-8,
+                and check_step(quantity, step),
 
             "market_lot_size_valid":
-                market_min_qty <= quantity <= market_max_qty
-                and market_step > 0
-                and abs(
-                    round(quantity / market_step)
-                    * market_step - quantity
-                ) < 1e-8,
+                market_min <= quantity <= market_max
+                and check_step(quantity, market_step),
 
             "price_filter_valid":
                 min_price <= price <= max_price
-                and tick_size > 0
-                and abs(
-                    round(price / tick_size)
-                    * tick_size - price
-                ) < 1e-8,
+                and check_step(price, tick),
 
             "minimum_notional_valid":
                 notional >= min_notional
 
         }
 
-        all_checks_passed = all(
+        passed = all(
             checks.values()
         )
 
@@ -568,14 +1087,11 @@ def validate_contract(
 
             "status": (
                 "validated"
-                if all_checks_passed
+                if passed
                 else "rejected"
             ),
 
-            "symbol": symbol,
-
-            "contract_status":
-                symbol_data.get("status"),
+            "symbol": symbol.upper(),
 
             "quantity": quantity,
 
@@ -583,28 +1099,11 @@ def validate_contract(
 
             "notional": notional,
 
-            "filters": {
-
-                "lot_size": lot_size,
-
-                "market_lot_size":
-                    market_lot_size,
-
-                "price_filter":
-                    price_filter,
-
-                "minimum_notional":
-                    minimum_notional
-
-            },
-
             "checks": checks,
 
-            "all_checks_passed":
-                all_checks_passed,
+            "all_checks_passed": passed,
 
-            "execution_enabled":
-                EXECUTION_ENABLED
+            "execution_enabled": False
 
         }
 
@@ -616,16 +1115,83 @@ def validate_contract(
 
             "error": str(e),
 
-            "execution_enabled":
-                EXECUTION_ENABLED
+            "execution_enabled": False
 
         }
 
 
 # =========================================================
+# VALIDATE-ONLY ENDPOINT
+# =========================================================
+
+@app.post("/validate-signal")
+async def validate_only(request: Request):
+
+    try:
+
+        body = await request.body()
+
+        signal, error = parse_signal(
+            body.decode("utf-8")
+        )
+
+        if error:
+
+            return JSONResponse(
+
+                status_code=400,
+
+                content={
+
+                    "status": "rejected",
+
+                    "reason": error,
+
+                    "execution_enabled": False
+
+                }
+
+            )
+
+        result = validate_signal(
+            signal,
+            account_number=1
+        )
+
+        log_event({
+
+            "event": "validate_only",
+
+            "signal": signal,
+
+            "result": result
+
+        })
+
+        return result
+
+    except Exception as e:
+
+        return JSONResponse(
+
+            status_code=400,
+
+            content={
+
+                "status": "error",
+
+                "detail": str(e),
+
+                "execution_enabled": False
+
+            }
+
+        )
+
+
+# =========================================================
 # WEBHOOK
-# APPLY SIGNAL LEVERAGE
-# NO ORDER EXECUTION
+# VALIDATION + LEVERAGE CONFIGURATION ONLY
 # =========================================================
 
 @app.post("/webhook")
@@ -638,11 +1204,6 @@ async def webhook(request: Request):
         message = body.decode(
             "utf-8"
         ).strip()
-
-        print(
-            "Incoming signal:",
-            message
-        )
 
         signal, error = parse_signal(
             message
@@ -660,29 +1221,64 @@ async def webhook(request: Request):
 
                     "reason": error,
 
-                    "execution_enabled":
-                        EXECUTION_ENABLED
+                    "execution_enabled": False
 
                 }
 
             )
 
-        # -------------------------------------------------
-        # SYMBOL MAPPING
-        # -------------------------------------------------
+        # Duplicate protection
+        fingerprint = signal_fingerprint(
+            signal
+        )
 
-        tv_symbol = signal[
-            "symbol"
-        ].upper()
+        now = time.time()
 
-        if tv_symbol in (
-            "XAUUSDT.P",
-            "XAUUSDT"
-        ):
+        expired = [
 
-            binance_symbol = "XAUUSDT"
+            key for key, timestamp
+            in SEEN_SIGNALS.items()
 
-        else:
+            if now - timestamp
+            > DUPLICATE_WINDOW_SECONDS
+
+        ]
+
+        for key in expired:
+
+            SEEN_SIGNALS.pop(
+                key,
+                None
+            )
+
+        if fingerprint in SEEN_SIGNALS:
+
+            return JSONResponse(
+
+                status_code=409,
+
+                content={
+
+                    "status": "duplicate_rejected",
+
+                    "reason": (
+                        "Duplicate signal detected "
+                        "within duplicate window"
+                    ),
+
+                    "execution_enabled": False
+
+                }
+
+            )
+
+        # Run pre-trade validation
+        validation = validate_signal(
+            signal,
+            account_number=1
+        )
+
+        if not validation.get("ready"):
 
             return JSONResponse(
 
@@ -692,129 +1288,75 @@ async def webhook(request: Request):
 
                     "status": "rejected",
 
-                    "reason": (
-                        f"Unsupported symbol: "
-                        f"{tv_symbol}"
-                    ),
+                    "signal": signal,
 
-                    "execution_enabled":
-                        EXECUTION_ENABLED
+                    "validation": validation,
+
+                    "execution_enabled": False
 
                 }
 
             )
 
-        # -------------------------------------------------
-        # CONTRACT VALIDATION
-        # -------------------------------------------------
-
+        # Apply leverage only after validations pass
         client = BinanceClient(1)
-
-        exchange_info = client.get_exchange_info()
-
-        symbol_data = None
-
-        for item in exchange_info.get("symbols", []):
-
-            if item.get("symbol") == binance_symbol:
-
-                symbol_data = item
-
-                break
-
-        if not symbol_data:
-
-            return JSONResponse(
-
-                status_code=400,
-
-                content={
-
-                    "status": "rejected",
-
-                    "reason": (
-                        "Binance symbol not found"
-                    ),
-
-                    "execution_enabled":
-                        EXECUTION_ENABLED
-
-                }
-
-            )
-
-        if symbol_data.get("status") != "TRADING":
-
-            return JSONResponse(
-
-                status_code=400,
-
-                content={
-
-                    "status": "rejected",
-
-                    "reason": (
-                        "Binance contract is not trading"
-                    ),
-
-                    "execution_enabled":
-                        EXECUTION_ENABLED
-
-                }
-
-            )
-
-        # -------------------------------------------------
-        # APPLY LEVERAGE FROM SIGNAL
-        # -------------------------------------------------
 
         leverage_result = (
             client.apply_and_verify_leverage(
-                binance_symbol,
+                TARGET_SYMBOL,
                 signal["leverage"]
             )
         )
 
-        # -------------------------------------------------
-        # RESPONSE
-        # -------------------------------------------------
+        # Record only after successful validation
+        SEEN_SIGNALS[fingerprint] = time.time()
 
-        return JSONResponse(
+        result = {
 
-            content={
+            "status": (
+                "validated_and_leverage_verified"
+            ),
 
-                "status":
-                    "signal_validated",
+            "signal": signal,
 
-                "signal":
-                    signal,
+            "validation": validation,
 
-                "binance_symbol":
-                    binance_symbol,
+            "leverage_result": (
+                leverage_result
+            ),
 
-                "account":
-                    "Account 1",
+            "account": "Account 1",
 
-                "leverage_result":
-                    leverage_result,
+            "execution_enabled": False,
 
-                "execution_enabled":
-                    EXECUTION_ENABLED,
+            "message": (
+                "Validation passed and leverage verified. "
+                "No orders placed."
+            )
 
-                "message":
-                    "Signal validated and leverage applied. "
-                    "No orders placed."
+        }
 
-            }
+        log_event({
 
-        )
+            "event": "webhook_validation_passed",
+
+            "signal": signal,
+
+            "result": result
+
+        })
+
+        return result
 
     except Exception as e:
 
-        print(
-            "Webhook error:",
-            str(e)
-        )
+        log_event({
+
+            "event": "webhook_error",
+
+            "error": str(e)
+
+        })
 
         return JSONResponse(
 
@@ -826,8 +1368,7 @@ async def webhook(request: Request):
 
                 "detail": str(e),
 
-                "execution_enabled":
-                    EXECUTION_ENABLED
+                "execution_enabled": False
 
             }
 
