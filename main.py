@@ -1,3 +1,4 @@
+
 import re
 import requests
 from fastapi import FastAPI, Request
@@ -81,6 +82,140 @@ async def test_connections():
         "accounts": results,
         "execution_enabled": False
     }
+
+
+@app.get("/validate-contract")
+async def validate_contract(
+    symbol: str = "XAUUSDT",
+    quantity: float = 1,
+    price: float = 3500
+):
+    try:
+        if quantity <= 0 or price <= 0:
+            return {
+                "status": "rejected",
+                "reason": "Quantity and price must be positive",
+                "execution_enabled": False
+            }
+
+        response = requests.get(
+            BINANCE_DEMO_URL + "/fapi/v1/exchangeInfo",
+            timeout=20
+        )
+
+        response.raise_for_status()
+        exchange_info = response.json()
+
+        contract = next(
+            (
+                item for item in exchange_info.get("symbols", [])
+                if item.get("symbol") == symbol.upper()
+            ),
+            None
+        )
+
+        if not contract:
+            return {
+                "status": "rejected",
+                "symbol": symbol,
+                "reason": "Symbol not found",
+                "execution_enabled": False
+            }
+
+        filters = {
+            item["filterType"]: item
+            for item in contract.get("filters", [])
+        }
+
+        lot = filters.get("LOT_SIZE")
+        market_lot = filters.get("MARKET_LOT_SIZE")
+        price_filter = filters.get("PRICE_FILTER")
+        min_notional_filter = filters.get("MIN_NOTIONAL")
+
+        notional = quantity * price
+
+        def validate_quantity_filter(filter_data):
+            if not filter_data:
+                return False
+
+            min_qty = float(filter_data["minQty"])
+            max_qty = float(filter_data["maxQty"])
+            step_size = float(filter_data["stepSize"])
+
+            if quantity < min_qty or quantity > max_qty:
+                return False
+
+            if step_size <= 0:
+                return False
+
+            step_count = quantity / step_size
+
+            return abs(step_count - round(step_count)) < 1e-8
+
+        lot_size_valid = validate_quantity_filter(lot)
+        market_lot_size_valid = validate_quantity_filter(market_lot)
+
+        price_filter_valid = False
+
+        if price_filter:
+            min_price = float(price_filter["minPrice"])
+            max_price = float(price_filter["maxPrice"])
+            tick_size = float(price_filter["tickSize"])
+
+            if (
+                min_price <= price <= max_price
+                and tick_size > 0
+            ):
+                tick_count = price / tick_size
+
+                price_filter_valid = (
+                    abs(tick_count - round(tick_count)) < 1e-8
+                )
+
+        minimum_notional = (
+            float(min_notional_filter.get("notional", 0))
+            if min_notional_filter
+            else 0
+        )
+
+        minimum_notional_valid = (
+            notional >= minimum_notional
+            if min_notional_filter
+            else False
+        )
+
+        checks = {
+            "symbol_trading": contract.get("status") == "TRADING",
+            "lot_size_valid": lot_size_valid,
+            "market_lot_size_valid": market_lot_size_valid,
+            "price_filter_valid": price_filter_valid,
+            "minimum_notional_valid": minimum_notional_valid
+        }
+
+        return {
+            "status": "validated",
+            "symbol": contract["symbol"],
+            "contract_status": contract["status"],
+            "quantity": quantity,
+            "price": price,
+            "notional": round(notional, 8),
+            "filters": {
+                "lot_size": lot,
+                "market_lot_size": market_lot,
+                "price_filter": price_filter,
+                "minimum_notional": min_notional_filter
+            },
+            "checks": checks,
+            "all_checks_passed": all(checks.values()),
+            "execution_enabled": False
+        }
+
+    except Exception as e:
+        return {
+            "status": "error",
+            "detail": str(e),
+            "execution_enabled": False
+        }
 
 
 def extract_field(message, label):
