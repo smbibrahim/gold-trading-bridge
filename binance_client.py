@@ -53,16 +53,30 @@ class BinanceClient:
         else:
             response = self.session.request(method, url, data=params, timeout=15)
 
-        if not response.ok:
-            try:
-                payload = response.json()
-            except Exception:
-                payload = {"raw_response": response.text[:2000]}
-            raise BinanceAPIError(self.account_number, method, endpoint, response.status_code, payload, safe_params)
+        # Diagnostic-friendly handling: preserve HTTP status, content type and raw body
+        # when Binance (or a proxy) returns non-JSON, including an empty response.
         try:
-            return response.json()
-        except Exception as exc:
-            raise RuntimeError(f"Account {self.account_number}: JSON parsing failed at {endpoint}: {exc}")
+            payload = response.json()
+        except Exception:
+            payload = None
+        if not response.ok:
+            if not isinstance(payload, dict):
+                payload = {
+                    "raw_response": response.text[:2000],
+                    "content_type": response.headers.get("Content-Type"),
+                    "response_empty": not bool(response.text),
+                }
+            raise BinanceAPIError(self.account_number, method, endpoint, response.status_code, payload, safe_params)
+        if payload is not None:
+            return payload
+        return {
+            "diagnostic": "non_json_response",
+            "http_status": response.status_code,
+            "endpoint": endpoint,
+            "content_type": response.headers.get("Content-Type"),
+            "raw_response": response.text[:2000],
+            "response_empty": not bool(response.text),
+        }
 
     # EXPLICIT USER-TRIGGERED DEMO AGREEMENT SIGNING
     def sign_tradfi_perps_agreement(self):
