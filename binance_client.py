@@ -1,3 +1,4 @@
+
 import os
 import time
 import hmac
@@ -92,46 +93,35 @@ class BinanceClient:
         response.raise_for_status()
         return response.json()
 
-    def set_leverage(self, symbol, leverage):
+    # READ-ONLY: Current position mode
+    def get_position_mode(self):
         return self._signed_request(
-            "POST",
-            "/fapi/v1/leverage",
-            {
-                "symbol": symbol,
-                "leverage": leverage
-            }
+            "GET",
+            "/fapi/v1/positionSide/dual"
         )
 
-    def market_order(self, symbol, side, quantity):
+    # READ-ONLY: Current position information
+    def get_position_risk(self, symbol=None):
+        params = {}
+
+        if symbol:
+            params["symbol"] = symbol
+
         return self._signed_request(
-            "POST",
-            "/fapi/v1/order",
-            {
-                "symbol": symbol,
-                "side": side,
-                "type": "MARKET",
-                "quantity": quantity,
-                "newOrderRespType": "RESULT"
-            }
+            "GET",
+            "/fapi/v2/positionRisk",
+            params
         )
 
-    def protective_order(
-        self,
-        symbol,
-        side,
-        order_type,
-        trigger_price
-    ):
+    # READ-ONLY: Leverage bracket information
+    def get_leverage_brackets(self, symbol=None):
+        params = {}
+
+        if symbol:
+            params["symbol"] = symbol
+
         return self._signed_request(
-            "POST",
-            "/fapi/v1/algoOrder",
-            {
-                "algoType": "CONDITIONAL",
-                "symbol": symbol,
-                "side": side,
-                "type": order_type,
-                "triggerPrice": trigger_price,
-                "closePosition": "true",
-                "workingType": "CONTRACT_PRICE"
-            }
+            "GET",
+            "/fapi/v1/leverageBracket",
+            params
         )
