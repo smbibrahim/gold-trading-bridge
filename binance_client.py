@@ -72,8 +72,19 @@ class BinanceClient:
     def place_market_order(self, symbol, side, quantity):
         return self._signed_request("POST", "/fapi/v1/order", {"symbol":symbol, "side":side.upper(), "type":"MARKET", "quantity":str(quantity), "newOrderRespType":"RESULT"})
     def place_close_position_order(self, symbol, side, order_type, stop_price):
-        if order_type not in ("STOP_MARKET", "TAKE_PROFIT_MARKET"): raise ValueError("Unsupported protective order type")
-        return self._signed_request("POST", "/fapi/v1/order", {"symbol":symbol, "side":side.upper(), "type":order_type, "stopPrice":str(stop_price), "closePosition":"true", "workingType":"MARK_PRICE", "priceProtect":"true"})
+        """Submit a USD-M Futures close-all conditional order using the Algo Order API."""
+        if order_type not in ("STOP_MARKET", "TAKE_PROFIT_MARKET"):
+            raise ValueError("Unsupported protective order type")
+        params = {
+            "algoType": "CONDITIONAL",
+            "symbol": symbol,
+            "side": side.upper(),
+            "type": order_type,
+            "triggerPrice": str(stop_price),
+            "closePosition": "true",
+            "workingType": "MARK_PRICE",
+        }
+        return self._signed_request("POST", "/fapi/v1/algoOrder", params)
     def get_open_position(self, symbol):
         positions=self.get_position_risk(symbol)
         if isinstance(positions, list):
