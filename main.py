@@ -712,7 +712,7 @@ def validate_signal(signal, account_number=1):
         # -------------------------------------------------
 
         results["checks"]["duplicate_signal"] = (
-            False
+            True
         )
 
         # -------------------------------------------------
