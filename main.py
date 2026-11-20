@@ -1,7 +1,7 @@
-import os, json, re, time, hashlib, logging, threading
+import os, json, re, time, hashlib, hmac, logging, threading
 from typing import Any
 import requests
-from fastapi import FastAPI, Request
+from fastapi import FastAPI, Request, BackgroundTasks
 from fastapi.responses import JSONResponse
 from binance_client import BinanceClient
 
@@ -11,6 +11,10 @@ TARGET_SYMBOL = "XAUUSDT"
 EXECUTION_ENABLED = os.getenv("EXECUTION_ENABLED", "false").lower() == "true"
 RISK_LIMIT_PERCENT = float(os.getenv("RISK_LIMIT_PERCENT", "2"))
 DUPLICATE_WINDOW_SECONDS = 300
+WEBHOOK_SECRET = os.getenv("WEBHOOK_SECRET", "")
+EXECUTION_LOCK = threading.Lock()  # serializes entry/forced-close tasks across both accounts
+SIGNAL_STATUS = {}
+STATUS_LOCK = threading.Lock()
 SEEN_SIGNALS = {}
 LOCK = threading.Lock()
 logging.basicConfig(level=logging.INFO)
@@ -35,6 +39,11 @@ def signal_fingerprint(signal):
     return hashlib.sha256(raw.encode()).hexdigest()
 
 
+def release_signal(fp):
+    with LOCK:
+        SEEN_SIGNALS.pop(fp, None)
+
+
 def reserve_signal(signal):
     now = time.time()
     with LOCK:
@@ -46,6 +55,27 @@ def reserve_signal(signal):
             return False, fp
         SEEN_SIGNALS[fp] = now
         return True, fp
+
+
+def active_accounts():
+    return [n for n in (1, 2) if os.getenv(f"BINANCE_API_KEY_{n}") and os.getenv(f"BINANCE_API_SECRET_{n}")]
+
+
+def token_ok(request):
+    if not WEBHOOK_SECRET:
+        return True
+    supplied = request.headers.get("X-Webhook-Token", "")
+    return hmac.compare_digest(supplied.encode(), WEBHOOK_SECRET.encode())
+
+
+def set_status(fp, status, detail=None):
+    with STATUS_LOCK:
+        SIGNAL_STATUS[fp] = {"status": status, "updated_at": time.time(), "detail": detail}
+
+
+def get_status(fp):
+    with STATUS_LOCK:
+        return SIGNAL_STATUS.get(fp)
 
 
 def parse_signal(message):
@@ -99,7 +129,7 @@ def parse_signal(message):
             "side": side, "symbol": str(symbol).upper().strip(),
             "exchange": str(normalized.get("exchange", "BINANCE FUTURES")),
             "timeframe": str(normalized.get("timeframe") or normalized.get("interval") or "UNKNOWN"),
-            "leverage": leverage, "quantity": quantity, "entry": entry, "tp": tp, "sl": sl,
+            "leverage": leverage, "margin_mode": ("ISOLATED" if "isolated" in str(lev_value).lower() else "CROSS"), "quantity": quantity, "entry": entry, "tp": tp, "sl": sl,
         }, None
     except Exception as exc:
         return None, str(exc)
@@ -199,18 +229,26 @@ def verify_algo_orders(client, symbol, algo_ids):
     return verified
 
 
-def execute_for_account(signal, account_number):
+def execute_for_account(signal, account_number, pre=None):
     outcome = {"account": f"Account {account_number}", "status": "starting"}
     client = BinanceClient(account_number)
     entry_attempted = False
     try:
-        pre = validate_signal(signal, account_number)
+        pre = pre or validate_signal(signal, account_number)
         outcome["validation"] = pre
         if not pre.get("ready"):
             outcome["status"] = "rejected_validation"; return outcome
         # Recheck just before order submission.
         if client.get_position_mode().get("dualSidePosition") or client.get_open_position(TARGET_SYMBOL):
             outcome["status"] = "rejected_final_position_or_mode_check"; return outcome
+        # Safe stale Algo cleanup only after the account is confirmed flat.
+        try:
+            client.cancel_all_open_algo_orders(TARGET_SYMBOL)
+            outcome["stale_algo_cleanup"] = "attempted_after_flat_check"
+        except Exception as cleanup_exc:
+            outcome["stale_algo_cleanup_warning"] = str(cleanup_exc)
+        margin_result = client.set_margin_type(TARGET_SYMBOL, signal.get("margin_mode", "CROSS"))
+        outcome["margin_type"] = margin_result
         lev = client.set_leverage(TARGET_SYMBOL, signal["leverage"])
         outcome["leverage"] = lev
         entry_side = "BUY" if signal["side"] == "LONG" else "SELL"
@@ -291,17 +329,19 @@ def diagnostic():
     return {"results": results, "execution_enabled": EXECUTION_ENABLED}
 
 @app.get("/test-connections")
-def test_connections():
+def test_connections(request: Request):
+    if not token_ok(request): return JSONResponse(status_code=401, content={"status":"unauthorized"})
     results=[]
-    for n in (1,2):
+    for n in (active_accounts() or (1,2)):
         try: results.append(BinanceClient(n).test_connection())
         except Exception as exc: results.append({"account":f"Account {n}","status":"error","error":str(exc)})
     return {"results":results,"execution_enabled":EXECUTION_ENABLED}
 
 @app.get("/account-config")
-def account_config():
+def account_config(request: Request):
+    if not token_ok(request): return JSONResponse(status_code=401, content={"status":"unauthorized"})
     results=[]
-    for n in (1,2):
+    for n in (active_accounts() or (1,2)):
         try:
             c=BinanceClient(n); results.append({"account":f"Account {n}","position_mode":c.get_position_mode(),"positions":c.get_position_risk(TARGET_SYMBOL),"brackets":c.get_leverage_brackets(TARGET_SYMBOL)})
         except Exception as exc: results.append({"account":f"Account {n}","error":str(exc)})
@@ -317,38 +357,130 @@ def validate_contract(symbol: str = TARGET_SYMBOL, quantity: float = 1, price: f
         return {"status":"validated" if all(checks.values()) else "rejected","symbol":symbol,"quantity":quantity,"price":price,"checks":checks,"execution_enabled":EXECUTION_ENABLED}
     except Exception as exc: return {"status":"error","error":str(exc),"execution_enabled":EXECUTION_ENABLED}
 
+@app.post("/sign-tradfi-agreement")
+def sign_tradfi_agreement(request: Request):
+    """Explicitly sign Binance TradFi Perps agreement on configured Demo accounts."""
+    if not token_ok(request):
+        return JSONResponse(status_code=401, content={"status": "unauthorized"})
+    if not EXECUTION_ENABLED:
+        return JSONResponse(status_code=503, content={"status": "execution_disabled", "mode": "BINANCE_DEMO"})
+    accounts = active_accounts()
+    if not accounts:
+        return JSONResponse(status_code=400, content={"status": "no_configured_accounts"})
+    results = []
+    for n in accounts:
+        try:
+            c = BinanceClient(n)
+            result = c.sign_tradfi_perps_agreement()
+            results.append({"account": f"Account {n}", "status": "success", "response": result})
+        except Exception as exc:
+            results.append({"account": f"Account {n}", "status": "failed", "error": str(exc)})
+    overall = "success" if all(r["status"] == "success" for r in results) else "partial_or_failed"
+    log_event({"event": "tradfi_agreement_sign_attempt", "results": results})
+    return {"status": overall, "mode": "BINANCE_DEMO", "accounts": results}
+
+
 @app.post("/validate-signal")
 async def validate_only(request: Request):
+    if not token_ok(request): return JSONResponse(status_code=401, content={"status":"unauthorized"})
     try:
         signal,error=parse_signal((await request.body()).decode())
         if error: return JSONResponse(status_code=400,content={"status":"rejected","reason":error,"execution_enabled":EXECUTION_ENABLED})
-        results=[validate_signal(signal,n) for n in (1,2)]
+        results=[validate_signal(signal,n) for n in (active_accounts() or (1,2))]
         return {"status":"multi_account_validation","signal":signal,"accounts":results,"execution_enabled":EXECUTION_ENABLED}
     except Exception as exc: return JSONResponse(status_code=400,content={"status":"error","detail":str(exc),"execution_enabled":EXECUTION_ENABLED})
 
-@app.post("/webhook")
-async def webhook(request: Request):
+def run_forced_close(close_side):
+    results = []
+    with EXECUTION_LOCK:
+        for n in active_accounts():
+            try:
+                c = BinanceClient(n)
+                pos = c.get_open_position(TARGET_SYMBOL)
+                if not pos:
+                    results.append({"account": f"Account {n}", "status": "already_flat"}); continue
+                amt = float(pos.get("positionAmt", 0))
+                current_side = "LONG" if amt > 0 else "SHORT" if amt < 0 else None
+                if current_side != close_side:
+                    results.append({"account": f"Account {n}", "status": "direction_mismatch"}); continue
+                c.cancel_all_open_algo_orders(TARGET_SYMBOL)
+                close_result = c.close_position_market(TARGET_SYMBOL)
+                results.append({"account": f"Account {n}", "status": "closed" if close_result.get("confirmed_flat") else "close_unconfirmed", "result": close_result})
+            except Exception as exc:
+                results.append({"account": f"Account {n}", "status": "error", "error": str(exc)})
+    log_event({"event": "forced_close_result", "requested_side": close_side, "accounts": results})
+
+
+def run_entry(signal, fp):
+    set_status(fp, "EXECUTING")
+    results = []
     try:
-        raw=(await request.body()).decode("utf-8").strip()
-        try: payload=json.loads(raw)
-        except json.JSONDecodeError: payload=None
-        if isinstance(payload,dict) and str(payload.get("type","")).upper()=="KEEPALIVE":
-            log_event({"event":"keepalive_received","source":payload.get("source","unknown")})
-            return {"status":"keepalive_received","trading":False,"binance_contacted":False}
-        signal,error=parse_signal(raw)
-        if error: return JSONResponse(status_code=400,content={"status":"rejected","reason":error,"execution_enabled":EXECUTION_ENABLED})
-        if not EXECUTION_ENABLED: return JSONResponse(status_code=503,content={"status":"execution_disabled","mode":"BINANCE_DEMO","execution_enabled":False})
-        accepted,fp=reserve_signal(signal)
-        if not accepted: return JSONResponse(status_code=409,content={"status":"duplicate_rejected","execution_enabled":True})
-        # Preflight both accounts before any order is sent.
-        preflight=[validate_signal(signal,n) for n in (1,2)]
-        if not all(x.get("ready") for x in preflight):
-            return JSONResponse(status_code=400,content={"status":"rejected_preflight","accounts":preflight,"execution_enabled":True})
-        # Sequential execution; failures on one account do not imply success on the other.
-        results=[execute_for_account(signal,n) for n in (1,2)]
-        response={"status":"multi_account_execution","signal":signal,"accounts":results,"execution_enabled":True,"demo_only":True}
-        log_event({"event":"execution_result","fingerprint":fp,"results":results})
-        return response
+        with EXECUTION_LOCK:
+            accounts = active_accounts()
+            if not accounts:
+                set_status(fp, "FAILED", {"reason": "No account credentials configured"})
+                release_signal(fp)
+                log_event({"event": "rejected_no_accounts", "fingerprint": fp})
+                return
+            preflight = [validate_signal(signal, n) for n in accounts]
+            if not all(x.get("ready") for x in preflight):
+                set_status(fp, "FAILED_PREFLIGHT", preflight)
+                release_signal(fp)
+                log_event({"event": "rejected_preflight", "fingerprint": fp, "accounts": preflight})
+                return
+            results = [execute_for_account(signal, n, pre) for n, pre in zip(accounts, preflight)]
+            statuses = [x.get("status") for x in results]
+            if all(x == "EXECUTED_AND_PROTECTED" for x in statuses):
+                final_status = "EXECUTED"
+            elif any(x == "EXECUTED_AND_PROTECTED" for x in statuses):
+                final_status = "PARTIAL"
+            else:
+                final_status = "FAILED"
+            set_status(fp, final_status, results)
+            log_event({"event": "execution_result", "fingerprint": fp, "signal": signal, "results": results})
     except Exception as exc:
-        log_event({"event":"webhook_error","error":str(exc)})
-        return JSONResponse(status_code=400,content={"status":"error","detail":str(exc),"execution_enabled":EXECUTION_ENABLED})
+        set_status(fp, "FAILED", {"error": str(exc), "account_results": results})
+        log_event({"event": "run_entry_error", "fingerprint": fp, "error": str(exc), "results": results})
+
+
+@app.get("/signal-status/{fingerprint}")
+def signal_status(fingerprint: str, request: Request):
+    if not token_ok(request): return JSONResponse(status_code=401, content={"status":"unauthorized"})
+    record = get_status(fingerprint)
+    if record is None: return JSONResponse(status_code=404, content={"status":"not_found"})
+    return {"fingerprint": fingerprint, **record}
+
+
+@app.post("/webhook")
+async def webhook(request: Request, background: BackgroundTasks):
+    try:
+        raw = (await request.body()).decode("utf-8", errors="replace").strip()
+        try: payload = json.loads(raw)
+        except json.JSONDecodeError: payload = None
+        if isinstance(payload, dict) and str(payload.get("type", "")).upper() == "KEEPALIVE":
+            log_event({"event": "keepalive_received", "source": payload.get("source", "unknown")})
+            return {"status": "keepalive_received", "trading": False, "binance_contacted": False}
+        if not token_ok(request):
+            log_event({"event": "webhook_unauthorized"})
+            return JSONResponse(status_code=401, content={"status": "unauthorized"})
+        if raw.lower() in ("/close_long", "/close_short"):
+            if not EXECUTION_ENABLED:
+                return JSONResponse(status_code=503, content={"status": "execution_disabled", "mode": "BINANCE_DEMO", "execution_enabled": False})
+            close_side = "LONG" if raw.lower() == "/close_long" else "SHORT"
+            background.add_task(run_forced_close, close_side)
+            return {"status": "close_accepted", "requested_side": close_side, "demo_only": True}
+        signal, error = parse_signal(raw)
+        if error:
+            log_event({"event": "signal_rejected", "reason": error, "raw": raw[:500]})
+            return JSONResponse(status_code=400, content={"status": "rejected", "reason": error, "execution_enabled": EXECUTION_ENABLED})
+        if not EXECUTION_ENABLED:
+            return JSONResponse(status_code=503, content={"status": "execution_disabled", "mode": "BINANCE_DEMO", "execution_enabled": False})
+        accepted, fp = reserve_signal(signal)
+        if not accepted:
+            return JSONResponse(status_code=409, content={"status": "duplicate_rejected", "execution_enabled": True})
+        set_status(fp, "ACCEPTED")
+        background.add_task(run_entry, signal, fp)
+        return {"status": "accepted", "fingerprint": fp, "accounts": active_accounts(), "demo_only": True, "execution_note": "Accepted by bridge; execution outcome is asynchronous. Check signal-status endpoint or Render logs."}
+    except Exception as exc:
+        log_event({"event": "webhook_error", "error": str(exc)})
+        return JSONResponse(status_code=400, content={"status": "error", "detail": str(exc), "execution_enabled": EXECUTION_ENABLED})
