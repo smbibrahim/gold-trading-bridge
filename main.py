@@ -1228,11 +1228,28 @@ def process_demo_signal(signal, fingerprint):
 
 @app.post("/webhook")
 async def webhook(request: Request, background_tasks: BackgroundTasks):
-    if not EXECUTION_ENABLED:
-        return JSONResponse(status_code=503, content={"status": "execution_disabled", "execution_enabled": False})
     try:
         body = await request.body()
-        signal, error = parse_signal(body.decode("utf-8").strip())
+        raw_body = body.decode("utf-8").strip()
+
+        # Dedicated keep-alive payload: never parse as a trade or contact Binance.
+        try:
+            keepalive_payload = json.loads(raw_body)
+        except json.JSONDecodeError:
+            keepalive_payload = None
+
+        if isinstance(keepalive_payload, dict) and str(keepalive_payload.get("type", "")).upper() == "KEEPALIVE":
+            log_event({"event": "keepalive_received", "source": keepalive_payload.get("source", "unknown")})
+            return JSONResponse(status_code=200, content={
+                "status": "keepalive_received",
+                "trading": False,
+                "binance_contacted": False
+            })
+
+        if not EXECUTION_ENABLED:
+            return JSONResponse(status_code=503, content={"status": "execution_disabled", "execution_enabled": False})
+
+        signal, error = parse_signal(raw_body)
         if error:
             return JSONResponse(status_code=400, content={"status": "rejected", "reason": error})
 
