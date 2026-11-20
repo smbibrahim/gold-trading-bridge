@@ -4,37 +4,26 @@ import re
 import time
 import hashlib
 import logging
+from typing import Any
 
 import requests
-
-from fastapi import FastAPI, Request, BackgroundTasks
+from fastapi import FastAPI, Request
 from fastapi.responses import JSONResponse
 
 from binance_client import BinanceClient
 
-
-app = FastAPI(title="Gold Trading Bridge - Pre-Trade Validation")
+app = FastAPI(title="Gold Trading Bridge - Safety Revision")
 
 BINANCE_BASE_URL = "https://demo-fapi.binance.com"
-EXECUTION_ENABLED = False
 TARGET_SYMBOL = "XAUUSDT"
-
-RISK_LIMIT_PERCENT = float(
-    os.getenv("RISK_LIMIT_PERCENT", "2")
-)
-
-# In-memory duplicate protection.
-# This resets when Render restarts.
-SEEN_SIGNALS = {}
+EXECUTION_ENABLED = False  # HARD DISABLED: this revision is validation/diagnostic only.
+RISK_LIMIT_PERCENT = float(os.getenv("RISK_LIMIT_PERCENT", "2"))
 DUPLICATE_WINDOW_SECONDS = 300
+SEEN_SIGNALS = {}
 
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger("gold_bridge")
 
-
-# =========================================================
-# UTILITIES
-# =========================================================
 
 def log_event(event):
     logger.info(json.dumps(event, default=str))
@@ -46,1402 +35,406 @@ def clean_number(value):
 
 def normalize_symbol(symbol):
     symbol = str(symbol).upper().strip()
-
-    if symbol in ("XAUUSDT.P", "XAUUSDT"):
-        return "XAUUSDT"
-
-    return None
+    return "XAUUSDT" if symbol in ("XAUUSDT.P", "XAUUSDT") else None
 
 
 def signal_fingerprint(signal):
-    raw = json.dumps(
-        signal,
-        sort_keys=True
-    )
-
-    return hashlib.sha256(
-        raw.encode("utf-8")
-    ).hexdigest()
+    raw = json.dumps(signal, sort_keys=True, separators=(",", ":"))
+    return hashlib.sha256(raw.encode("utf-8")).hexdigest()
 
 
-def check_duplicate(signal):
+def is_duplicate(signal):
     now = time.time()
+    for key, timestamp in list(SEEN_SIGNALS.items()):
+        if now - timestamp > DUPLICATE_WINDOW_SECONDS:
+            SEEN_SIGNALS.pop(key, None)
+    return signal_fingerprint(signal) in SEEN_SIGNALS
 
-    expired = [
-        key for key, timestamp in SEEN_SIGNALS.items()
-        if now - timestamp > DUPLICATE_WINDOW_SECONDS
-    ]
 
-    for key in expired:
-        SEEN_SIGNALS.pop(key, None)
-
+def reserve_signal(signal):
+    now = time.time()
+    for key, timestamp in list(SEEN_SIGNALS.items()):
+        if now - timestamp > DUPLICATE_WINDOW_SECONDS:
+            SEEN_SIGNALS.pop(key, None)
     fingerprint = signal_fingerprint(signal)
-
     if fingerprint in SEEN_SIGNALS:
-        return True
-
+        return False
     SEEN_SIGNALS[fingerprint] = now
+    return True
 
-    return False
-
-
-# =========================================================
-# SIGNAL PARSER
-# =========================================================
 
 def parse_signal(message):
-
     try:
-
         if isinstance(message, dict):
             data = message
-
         else:
-
             message = str(message).strip()
-
             try:
                 data = json.loads(message)
-
             except json.JSONDecodeError:
-
                 data = {}
-
                 for line in message.splitlines():
-
                     line = line.strip()
+                    if ":" in line:
+                        key, value = line.split(":", 1)
+                        data[key.strip()] = value.strip()
 
-                    if ":" not in line:
-                        continue
+        normalized = {
+            str(key).lower().strip().replace(" ", "_"): value
+            for key, value in data.items()
+        }
 
-                    key, value = line.split(":", 1)
-
-                    data[key.strip()] = value.strip()
-
-        normalized = {}
-
-        for key, value in data.items():
-
-            normalized[
-                str(key).lower().strip().replace(" ", "_")
-            ] = value
-
-        side_value = (
-            normalized.get("side")
-            or normalized.get("direction")
-            or normalized.get("signal")
-        )
-
+        side_value = normalized.get("side") or normalized.get("direction") or normalized.get("signal")
         if not side_value:
             return None, "Missing direction"
-
         side_value = str(side_value).upper()
-
         if "LONG" in side_value:
             side = "LONG"
-
         elif "SHORT" in side_value:
             side = "SHORT"
-
         else:
             return None, "Invalid direction"
 
-        symbol = (
-            normalized.get("symbol")
-            or normalized.get("pair")
-        )
-
+        symbol = normalized.get("symbol") or normalized.get("pair")
         if not symbol:
             return None, "Missing symbol"
 
-        exchange = normalized.get(
-            "exchange",
-            "BINANCE FUTURES"
-        )
-
-        timeframe = (
-            normalized.get("timeframe")
-            or normalized.get("interval")
-            or "UNKNOWN"
-        )
-
         leverage_value = normalized.get("leverage")
-
         if leverage_value is None:
             return None, "Missing leverage"
-
-        leverage_match = re.search(
-            r"\d+",
-            str(leverage_value)
-        )
-
+        leverage_match = re.search(r"\d+", str(leverage_value))
         if not leverage_match:
             return None, "Invalid leverage"
-
         leverage = int(leverage_match.group())
-
-        if leverage < 1 or leverage > 125:
+        if not 1 <= leverage <= 125:
             return None, "Leverage out of range"
 
-        quantity_value = (
-            normalized.get("quantity")
-            or normalized.get("qty")
-        )
+        quantity_value = normalized.get("quantity") or normalized.get("qty")
+        entry_value = normalized.get("entry_price") or normalized.get("entry")
+        tp_value = normalized.get("take_profit") or normalized.get("tp") or normalized.get("tp_price")
+        sl_value = normalized.get("stop_loss") or normalized.get("sl") or normalized.get("sl_price")
 
         if quantity_value is None:
             return None, "Missing quantity"
-
-        quantity = clean_number(quantity_value)
-
-        entry_value = (
-            normalized.get("entry_price")
-            or normalized.get("entry")
-        )
-
-        tp_value = (
-            normalized.get("take_profit")
-            or normalized.get("tp")
-            or normalized.get("tp_price")
-        )
-
-        sl_value = (
-            normalized.get("stop_loss")
-            or normalized.get("sl")
-            or normalized.get("sl_price")
-        )
-
         if entry_value is None:
             return None, "Missing entry"
-
         if tp_value is None:
             return None, "Missing take profit"
-
         if sl_value is None:
             return None, "Missing stop loss"
 
+        quantity = clean_number(quantity_value)
         entry = clean_number(entry_value)
         tp = clean_number(tp_value)
         sl = clean_number(sl_value)
 
         if quantity <= 0:
             return None, "Quantity must be positive"
-
-        if entry <= 0 or tp <= 0 or sl <= 0:
+        if any(x <= 0 for x in (entry, tp, sl)):
             return None, "Prices must be positive"
-
-        if side == "LONG":
-
-            if not sl < entry < tp:
-                return None, "Invalid LONG price relationship"
-
-        if side == "SHORT":
-
-            if not tp < entry < sl:
-                return None, "Invalid SHORT price relationship"
+        if side == "LONG" and not sl < entry < tp:
+            return None, "Invalid LONG price relationship"
+        if side == "SHORT" and not tp < entry < sl:
+            return None, "Invalid SHORT price relationship"
 
         signal = {
             "side": side,
             "symbol": str(symbol).upper().strip(),
-            "exchange": str(exchange),
-            "timeframe": str(timeframe),
+            "exchange": str(normalized.get("exchange", "BINANCE FUTURES")),
+            "timeframe": str(normalized.get("timeframe") or normalized.get("interval") or "UNKNOWN"),
             "leverage": leverage,
             "quantity": quantity,
             "entry": entry,
             "tp": tp,
-            "sl": sl
+            "sl": sl,
         }
-
         return signal, None
+    except Exception as exc:
+        return None, str(exc)
 
-    except Exception as e:
-
-        return None, str(e)
-
-
-# =========================================================
-# CONTRACT INFORMATION
-# =========================================================
 
 def get_symbol_info(client, symbol):
-
     exchange_info = client.get_exchange_info()
-
     for item in exchange_info.get("symbols", []):
-
         if item.get("symbol") == symbol:
             return item
-
     return None
 
 
 def get_filters(symbol_data):
-
-    result = {}
-
-    for item in symbol_data.get("filters", []):
-
-        result[item["filterType"]] = item
-
-    return result
+    return {item["filterType"]: item for item in symbol_data.get("filters", [])}
 
 
 def check_step(value, step):
-
     step = float(step)
-
     if step <= 0:
         return False
+    # Use tolerance to avoid binary floating-point artifacts.
+    return abs(round(value / step) * step - value) < max(1e-8, step * 1e-8)
 
-    return abs(
-        round(value / step) * step - value
-    ) < 1e-8
-
-
-# =========================================================
-# ACCOUNT VALIDATION
-# =========================================================
 
 def get_account_snapshot(client, symbol):
-
     account = client.get_account()
-
     positions = client.get_position_risk(symbol)
-
     active_positions = []
-
     if isinstance(positions, list):
-
         for position in positions:
-
-            if position.get("symbol") != symbol:
-                continue
-
-            position_amt = float(
-                position.get("positionAmt", 0)
-            )
-
-            if abs(position_amt) > 0:
+            if position.get("symbol") == symbol and abs(float(position.get("positionAmt", 0))) > 0:
                 active_positions.append(position)
-
     return account, active_positions
 
 
-# =========================================================
-# PRE-TRADE VALIDATION ENGINE
-# =========================================================
-
-def confirm_position_with_retries(client, symbol, attempts=5, delay_seconds=1.0):
-    """Read-only position confirmation with bounded retries after entry."""
-    last_error = None
-    for attempt in range(1, attempts + 1):
-        try:
-            position = client.get_open_position(symbol)
-            if position and abs(float(position.get("positionAmt", 0))) > 0:
-                return position, {"confirmed": True, "attempts": attempt}
-        except Exception as exc:
-            last_error = str(exc)
-        if attempt < attempts:
-            time.sleep(delay_seconds)
-    return None, {"confirmed": False, "attempts": attempts, "last_error": last_error}
-
-
-def verify_protective_algos(client, symbol, sl_order, tp_order, sl_price, tp_price, attempts=3, delay_seconds=1.0):
-    """Confirm both submitted conditional orders appear in Binance open algo orders."""
-    expected_ids = {
-        str(sl_order.get("algoId")) if isinstance(sl_order, dict) and sl_order.get("algoId") is not None else None,
-        str(tp_order.get("algoId")) if isinstance(tp_order, dict) and tp_order.get("algoId") is not None else None,
-    }
-    expected_ids.discard(None)
-    last_snapshot = None
-    for attempt in range(1, attempts + 1):
-        orders = client.get_open_algo_orders(symbol)
-        last_snapshot = orders
-        if isinstance(orders, dict):
-            orders = orders.get("orders", orders.get("data", []))
-        if isinstance(orders, list):
-            found_ids = {str(o.get("algoId")) for o in orders if isinstance(o, dict) and o.get("algoId") is not None}
-            ids_verified = bool(expected_ids) and expected_ids.issubset(found_ids)
-            # ID verification is authoritative for the orders just submitted.
-            if ids_verified:
-                return {"verified": True, "attempts": attempt, "algo_ids": sorted(expected_ids)}
-        if attempt < attempts:
-            time.sleep(delay_seconds)
-    return {"verified": False, "attempts": attempts, "expected_algo_ids": sorted(expected_ids), "last_snapshot": last_snapshot}
-
-
 def validate_signal(signal, account_number=1):
-
-    results = {
-        "account": f"Account {account_number}",
-        "checks": {},
-        "reasons": [],
-        "ready": False
-    }
-
+    results = {"account": f"Account {account_number}", "checks": {}, "reasons": [], "ready": False}
     try:
-
         client = BinanceClient(account_number)
-
-        # -------------------------------------------------
-        # SYMBOL
-        # -------------------------------------------------
-
-        binance_symbol = normalize_symbol(
-            signal["symbol"]
-        )
-
-        results["binance_symbol"] = binance_symbol
-
-        if not binance_symbol:
-
-            results["reasons"].append(
-                "Unsupported symbol"
-            )
-
+        symbol = normalize_symbol(signal["symbol"])
+        results["binance_symbol"] = symbol
+        if not symbol:
+            results["status"] = "REJECTED"
+            results["reasons"].append("Unsupported symbol")
             return results
 
-        # -------------------------------------------------
-        # CONTRACT
-        # -------------------------------------------------
-
-        symbol_data = get_symbol_info(
-            client,
-            binance_symbol
-        )
-
+        symbol_data = get_symbol_info(client, symbol)
         if not symbol_data:
-
-            results["reasons"].append(
-                "Contract not found"
-            )
-
+            results["status"] = "REJECTED"
+            results["reasons"].append("Contract not found")
             return results
 
         filters = get_filters(symbol_data)
-
         lot = filters.get("LOT_SIZE", {})
         market_lot = filters.get("MARKET_LOT_SIZE", {})
         price_filter = filters.get("PRICE_FILTER", {})
-        min_notional_filter = filters.get("MIN_NOTIONAL", {})
+        min_notional_filter = filters.get("MIN_NOTIONAL", filters.get("NOTIONAL", {}))
 
-        quantity = signal["quantity"]
-        entry = signal["entry"]
-        leverage = signal["leverage"]
-
+        quantity, entry, leverage = signal["quantity"], signal["entry"], signal["leverage"]
         notional = quantity * entry
+        lot_min, lot_max, lot_step = float(lot.get("minQty", 0)), float(lot.get("maxQty", 0)), float(lot.get("stepSize", 0))
+        market_min, market_max, market_step = float(market_lot.get("minQty", 0)), float(market_lot.get("maxQty", 0)), float(market_lot.get("stepSize", 0))
+        price_min, price_max, tick = float(price_filter.get("minPrice", 0)), float(price_filter.get("maxPrice", 0)), float(price_filter.get("tickSize", 0))
+        min_notional = float(min_notional_filter.get("notional", min_notional_filter.get("minNotional", 0)))
 
-        lot_min = float(lot.get("minQty", 0))
-        lot_max = float(lot.get("maxQty", 0))
-        lot_step = float(lot.get("stepSize", 0))
-
-        market_min = float(market_lot.get("minQty", 0))
-        market_max = float(market_lot.get("maxQty", 0))
-        market_step = float(market_lot.get("stepSize", 0))
-
-        price_min = float(
-            price_filter.get("minPrice", 0)
-        )
-
-        price_max = float(
-            price_filter.get("maxPrice", 0)
-        )
-
-        tick = float(
-            price_filter.get("tickSize", 0)
-        )
-
-        min_notional = float(
-            min_notional_filter.get(
-                "notional",
-                min_notional_filter.get("minNotional", 0)
-            )
-        )
-
-        contract_trading = (
-            symbol_data.get("status") == "TRADING"
-        )
-
-        lot_valid = (
-            lot_min <= quantity <= lot_max
-            and check_step(quantity, lot_step)
-        )
-
-        market_lot_valid = (
-            market_min <= quantity <= market_max
-            and check_step(quantity, market_step)
-        )
-
+        contract_trading = symbol_data.get("status") == "TRADING"
+        lot_valid = lot_min <= quantity <= lot_max and check_step(quantity, lot_step)
+        market_lot_valid = market_min <= quantity <= market_max and check_step(quantity, market_step)
         price_valid = (
             price_min <= entry <= price_max
             and check_step(entry, tick)
             and check_step(signal["tp"], tick)
             and check_step(signal["sl"], tick)
         )
-
         notional_valid = notional >= min_notional
 
-        results["checks"]["contract_trading"] = (
-            contract_trading
-        )
+        results["checks"].update({
+            "contract_trading": contract_trading,
+            "lot_size_valid": lot_valid,
+            "market_lot_size_valid": market_lot_valid,
+            "price_precision_valid": price_valid,
+            "minimum_notional_valid": notional_valid,
+        })
+        for check, valid, reason in [
+            ("contract_trading", contract_trading, "Contract is not trading"),
+            ("lot_size_valid", lot_valid, "LOT_SIZE validation failed"),
+            ("market_lot_size_valid", market_lot_valid, "MARKET_LOT_SIZE validation failed"),
+            ("price_precision_valid", price_valid, "Price precision/filter validation failed"),
+            ("minimum_notional_valid", notional_valid, "Minimum notional validation failed"),
+        ]:
+            if not valid:
+                results["reasons"].append(reason)
 
-        results["checks"]["lot_size_valid"] = (
-            lot_valid
-        )
+        account, active_positions = get_account_snapshot(client, symbol)
+        available_balance = float(account.get("availableBalance", 0))
+        wallet = float(account.get("totalWalletBalance", 0))
+        margin_balance = float(account.get("totalMarginBalance", 0))
+        results["account_balance"] = {"available_balance": available_balance, "wallet_balance": wallet, "margin_balance": margin_balance}
+        account_connected = bool(account.get("canTrade", False))
+        results["checks"]["account_connected"] = account_connected
+        if not account_connected:
+            results["reasons"].append("Account trading permission is unavailable")
 
-        results["checks"]["market_lot_size_valid"] = (
-            market_lot_valid
-        )
-
-        results["checks"]["price_precision_valid"] = (
-            price_valid
-        )
-
-        results["checks"]["minimum_notional_valid"] = (
-            notional_valid
-        )
-
-        if not contract_trading:
-            results["reasons"].append(
-                "Contract is not trading"
-            )
-
-        if not lot_valid:
-            results["reasons"].append(
-                "LOT_SIZE validation failed"
-            )
-
-        if not market_lot_valid:
-            results["reasons"].append(
-                "MARKET_LOT_SIZE validation failed"
-            )
-
-        if not price_valid:
-            results["reasons"].append(
-                "Price precision/filter validation failed"
-            )
-
-        if not notional_valid:
-            results["reasons"].append(
-                "Minimum notional validation failed"
-            )
-
-        # -------------------------------------------------
-        # ACCOUNT SNAPSHOT
-        # -------------------------------------------------
-
-        account, active_positions = get_account_snapshot(
-            client,
-            binance_symbol
-        )
-
-        available_balance = float(
-            account.get("availableBalance", 0)
-        )
-
-        total_wallet_balance = float(
-            account.get("totalWalletBalance", 0)
-        )
-
-        total_margin_balance = float(
-            account.get("totalMarginBalance", 0)
-        )
-
-        results["account_balance"] = {
-            "available_balance": available_balance,
-            "wallet_balance": total_wallet_balance,
-            "margin_balance": total_margin_balance
-        }
-
-        results["checks"]["account_connected"] = (
-            account.get("canTrade", False)
-        )
-
-        if not account.get("canTrade", False):
-            results["reasons"].append(
-                "Account trading permission is unavailable"
-            )
-
-        # -------------------------------------------------
-        # EXISTING POSITION CHECK
-        # -------------------------------------------------
-
-        results["existing_positions"] = len(
-            active_positions
-        )
-
-        position_clear = (
-            len(active_positions) == 0
-        )
-
-        results["checks"]["no_existing_position"] = (
-            position_clear
-        )
-
+        position_clear = len(active_positions) == 0
+        results["existing_positions"] = len(active_positions)
+        results["checks"]["no_existing_position"] = position_clear
         if not position_clear:
-            results["reasons"].append(
-                "Existing XAUUSDT position detected"
-            )
-
-        # -------------------------------------------------
-        # POSITION MODE CHECK (closePosition Algo protection requires One-Way mode)
-        # -------------------------------------------------
+            results["reasons"].append("Existing XAUUSDT position detected")
 
         position_mode = client.get_position_mode()
-        one_way_mode_valid = not bool(position_mode.get("dualSidePosition", False))
+        one_way_valid = not bool(position_mode.get("dualSidePosition", False))
         results["position_mode"] = position_mode
-        results["checks"]["one_way_mode_valid"] = one_way_mode_valid
-        if not one_way_mode_valid:
-            results["reasons"].append(
-                "Hedge Mode detected; One-Way Mode is required for this bridge's close-position protection"
-            )
+        results["checks"]["one_way_mode_valid"] = one_way_valid
+        if not one_way_valid:
+            results["reasons"].append("Hedge Mode detected; One-Way Mode is required")
 
-        # -------------------------------------------------
-        # LEVERAGE BRACKET CHECK
-        # -------------------------------------------------
-
-        bracket_data = client.get_leverage_brackets(
-            binance_symbol
-        )
-
-        bracket_list = []
-
+        bracket_data = client.get_leverage_brackets(symbol)
+        brackets = []
         if isinstance(bracket_data, list):
-
             for item in bracket_data:
-
-                if item.get("symbol") == binance_symbol:
-
-                    bracket_list = item.get(
-                        "brackets",
-                        []
-                    )
-
+                if item.get("symbol") == symbol:
+                    brackets = item.get("brackets", [])
                     break
+        elif isinstance(bracket_data, dict):
+            brackets = bracket_data.get("brackets", [])
 
-        else:
-
-            bracket_list = bracket_data.get(
-                "brackets",
-                []
-            )
-
-        applicable_bracket = None
-
-        for bracket in bracket_list:
-
-            floor = float(
-                bracket.get("notionalFloor", 0)
-            )
-
-            cap = float(
-                bracket.get("notionalCap", 0)
-            )
-
+        applicable = None
+        for bracket in brackets:
+            floor = float(bracket.get("notionalFloor", 0))
+            cap = float(bracket.get("notionalCap", 0))
             if floor <= notional <= cap:
-
-                applicable_bracket = bracket
-
+                applicable = bracket
                 break
+        max_leverage = int(applicable.get("initialLeverage")) if applicable else None
+        bracket_valid = max_leverage is not None and leverage <= max_leverage
+        results["leverage_bracket"] = {"requested_leverage": leverage, "maximum_leverage_for_notional": max_leverage}
+        results["checks"]["bracket_leverage_valid"] = bracket_valid
+        if not bracket_valid:
+            results["reasons"].append("Requested leverage exceeds bracket or bracket could not be determined")
 
-        maximum_bracket_leverage = (
-            int(applicable_bracket.get("initialLeverage"))
-            if applicable_bracket
-            else None
-        )
-
-        bracket_leverage_valid = (
-            maximum_bracket_leverage is not None
-            and leverage <= maximum_bracket_leverage
-        )
-
-        results["leverage_bracket"] = {
-            "requested_leverage": leverage,
-            "maximum_leverage_for_notional": (
-                maximum_bracket_leverage
-            )
-        }
-
-        results["checks"]["bracket_leverage_valid"] = (
-            bracket_leverage_valid
-        )
-
-        if not bracket_leverage_valid:
-
-            results["reasons"].append(
-                "Requested leverage exceeds applicable bracket "
-                "or bracket could not be determined"
-            )
-
-        # -------------------------------------------------
-        # MARGIN ESTIMATE
-        # -------------------------------------------------
-
-        estimated_initial_margin = (
-            notional / leverage
-        )
-
-        margin_valid = (
-            estimated_initial_margin
-            <= available_balance
-        )
-
-        results["margin_estimate"] = {
-            "notional": notional,
-            "requested_leverage": leverage,
-            "estimated_initial_margin": (
-                estimated_initial_margin
-            ),
-            "available_balance": available_balance
-        }
-
-        results["checks"]["margin_available"] = (
-            margin_valid
-        )
-
+        estimated_margin = notional / leverage
+        margin_valid = estimated_margin <= available_balance
+        results["margin_estimate"] = {"notional": notional, "requested_leverage": leverage, "estimated_initial_margin": estimated_margin, "available_balance": available_balance}
+        results["checks"]["margin_available"] = margin_valid
         if not margin_valid:
+            results["reasons"].append("Estimated initial margin exceeds available balance")
 
-            results["reasons"].append(
-                "Estimated initial margin exceeds available balance"
-            )
-
-        # -------------------------------------------------
-        # RISK ESTIMATE
-        # -------------------------------------------------
-
-        stop_distance = abs(
-            entry - signal["sl"]
-        )
-
-        estimated_loss = (
-            stop_distance * quantity
-        )
-
-        risk_percent = (
-            estimated_loss / total_wallet_balance * 100
-            if total_wallet_balance > 0
-            else float("inf")
-        )
-
-        risk_valid = (
-            total_wallet_balance > 0
-            and risk_percent <= RISK_LIMIT_PERCENT
-        )
-
+        stop_distance = abs(entry - signal["sl"])
+        estimated_loss = stop_distance * quantity
+        risk_percent = estimated_loss / wallet * 100 if wallet > 0 else float("inf")
+        risk_valid = wallet > 0 and risk_percent <= RISK_LIMIT_PERCENT
         results["risk_estimate"] = {
-
             "stop_distance": stop_distance,
-
-            "estimated_loss_at_stop": (
-                estimated_loss
-            ),
-
-            "wallet_balance": (
-                total_wallet_balance
-            ),
-
-            "estimated_risk_percent": (
-                risk_percent
-            ),
-
-            "risk_limit_percent": (
-                RISK_LIMIT_PERCENT
-            )
-
+            "estimated_loss_at_stop": estimated_loss,
+            "wallet_balance": wallet,
+            "estimated_risk_percent": risk_percent,
+            "risk_limit_percent": RISK_LIMIT_PERCENT,
+            "fees_and_slippage_included": False,
         }
-
-        results["checks"]["risk_limit_valid"] = (
-            risk_valid
-        )
-
+        results["checks"]["risk_limit_valid"] = risk_valid
         if not risk_valid:
+            results["reasons"].append("Estimated risk exceeds configured limit")
 
-            results["reasons"].append(
-                "Estimated risk exceeds configured risk limit"
-            )
-
-        # -------------------------------------------------
-        # DUPLICATE CHECK (read-only; does not reserve a signal)
-        # -------------------------------------------------
-
-        fingerprint = signal_fingerprint(signal)
-        now = time.time()
-        for key, timestamp in list(SEEN_SIGNALS.items()):
-            if now - timestamp > DUPLICATE_WINDOW_SECONDS:
-                SEEN_SIGNALS.pop(key, None)
-        duplicate_signal = fingerprint in SEEN_SIGNALS
-        results["checks"]["duplicate_signal"] = not duplicate_signal
-        if duplicate_signal:
+        # Validation does NOT reserve or consume a fingerprint.
+        duplicate = is_duplicate(signal)
+        results["checks"]["duplicate_signal"] = not duplicate
+        if duplicate:
             results["reasons"].append("Signal fingerprint was already accepted recently")
 
-        # -------------------------------------------------
-        # FINAL RESULT
-        # -------------------------------------------------
-
-        all_checks_passed = all(
-            results["checks"].values()
-        )
-
-        results["ready"] = all_checks_passed
-
-        results["status"] = (
-            "READY_FOR_LEVERAGE_CONFIGURATION"
-            if all_checks_passed
-            else "REJECTED"
-        )
-
-        results["execution_enabled"] = (
-            EXECUTION_ENABLED
-        )
-
+        results["ready"] = all(results["checks"].values())
+        results["status"] = "VALIDATION_PASS_EXECUTION_DISABLED" if results["ready"] else "REJECTED"
+        results["execution_enabled"] = EXECUTION_ENABLED
         return results
-
-    except Exception as e:
-
+    except Exception as exc:
         results["status"] = "ERROR"
-
-        results["reasons"].append(
-            str(e)
-        )
-
-        results["execution_enabled"] = (
-            EXECUTION_ENABLED
-        )
-
+        results["reasons"].append(str(exc))
+        results["execution_enabled"] = EXECUTION_ENABLED
         return results
 
-
-# =========================================================
-# ROUTES
-# =========================================================
 
 @app.get("/")
 def home():
-
-    return {
-
-        "service": "Gold Trading Bridge",
-
-        "status": "running",
-
-        "mode": "PRE-TRADE VALIDATION",
-
-        "execution_enabled": (
-            EXECUTION_ENABLED
-        )
-
-    }
+    return {"service": "Gold Trading Bridge", "status": "running", "mode": "VALIDATION_ONLY", "execution_enabled": EXECUTION_ENABLED}
 
 
 @app.get("/health")
 def health():
-
-    return {
-
-        "status": "healthy",
-
-        "execution_enabled": (
-            EXECUTION_ENABLED
-        )
-
-    }
+    return {"status": "healthy", "execution_enabled": EXECUTION_ENABLED, "mode": "VALIDATION_ONLY"}
 
 
 @app.get("/diagnostic")
 def diagnostic():
-
     results = {}
-
-    for name, endpoint in (
-        ("ping", "/fapi/v1/ping"),
-        ("time", "/fapi/v1/time")
-    ):
-
+    for name, endpoint in (("ping", "/fapi/v1/ping"), ("time", "/fapi/v1/time")):
         try:
-
-            response = requests.get(
-                BINANCE_BASE_URL + endpoint,
-                timeout=15
-            )
-
-            results[name] = {
-
-                "http_status": (
-                    response.status_code
-                ),
-
-                "success": (
-                    response.status_code == 200
-                ),
-
-                "response": (
-                    response.text
-                )
-
-            }
-
-        except Exception as e:
-
-            results[name] = {
-
-                "success": False,
-
-                "error": str(e)
-
-            }
-
-    return {
-
-        "results": results,
-
-        "execution_enabled": (
-            EXECUTION_ENABLED
-        )
-
-    }
+            response = requests.get(BINANCE_BASE_URL + endpoint, timeout=10)
+            results[name] = {"http_status": response.status_code, "success": response.status_code == 200, "response": response.text[:1000]}
+        except Exception as exc:
+            results[name] = {"success": False, "error": str(exc)}
+    return {"results": results, "execution_enabled": EXECUTION_ENABLED}
 
 
 @app.get("/test-connections")
 def test_connections():
-
     results = []
-
     for account_number in (1, 2):
-
         try:
-
-            client = BinanceClient(
-                account_number
-            )
-
-            results.append(
-                client.test_connection()
-            )
-
-        except Exception as e:
-
-            results.append({
-
-                "account": (
-                    f"Account {account_number}"
-                ),
-
-                "status": "error",
-
-                "error": str(e)
-
-            })
-
-    return {
-
-        "results": results,
-
-        "execution_enabled": (
-            EXECUTION_ENABLED
-        )
-
-    }
+            results.append(BinanceClient(account_number).test_connection())
+        except Exception as exc:
+            results.append({"account": f"Account {account_number}", "status": "error", "error": str(exc)})
+    return {"results": results, "execution_enabled": EXECUTION_ENABLED}
 
 
 @app.get("/account-config")
 def account_config():
-
     results = []
-
     for account_number in (1, 2):
-
         try:
-
-            client = BinanceClient(
-                account_number
-            )
-
+            client = BinanceClient(account_number)
             mode = client.get_position_mode()
-
-            position_risk = client.get_position_risk(
-                TARGET_SYMBOL
-            )
-
-            brackets = client.get_leverage_brackets(
-                TARGET_SYMBOL
-            )
-
-            leverage = []
-
-            if isinstance(position_risk, list):
-
-                for position in position_risk:
-
-                    if position.get("symbol") == TARGET_SYMBOL:
-
-                        leverage.append(
-                            position.get("leverage")
-                        )
-
-            results.append({
-
-                "account": (
-                    f"Account {account_number}"
-                ),
-
-                "status": "success",
-
-                "position_mode": mode,
-
-                "current_leverage": leverage,
-
-                "leverage_brackets": brackets
-
-            })
-
-        except Exception as e:
-
-            results.append({
-
-                "account": (
-                    f"Account {account_number}"
-                ),
-
-                "status": "error",
-
-                "error": str(e)
-
-            })
-
-    return {
-
-        "results": results,
-
-        "execution_enabled": (
-            EXECUTION_ENABLED
-        )
-
-    }
+            positions = client.get_position_risk(TARGET_SYMBOL)
+            brackets = client.get_leverage_brackets(TARGET_SYMBOL)
+            leverage = [p.get("leverage") for p in positions if p.get("symbol") == TARGET_SYMBOL] if isinstance(positions, list) else []
+            results.append({"account": f"Account {account_number}", "status": "success", "position_mode": mode, "current_leverage": leverage, "leverage_brackets": brackets})
+        except Exception as exc:
+            results.append({"account": f"Account {account_number}", "status": "error", "error": str(exc)})
+    return {"results": results, "execution_enabled": EXECUTION_ENABLED}
 
 
 @app.get("/validate-contract")
-def validate_contract(
-    symbol: str = "XAUUSDT",
-    quantity: float = 1,
-    price: float = 3500
-):
-
+def validate_contract(symbol: str = "XAUUSDT", quantity: float = 1, price: float = 3500):
     try:
-
         client = BinanceClient(1)
-
-        symbol_data = get_symbol_info(
-            client,
-            symbol.upper()
-        )
-
-        if not symbol_data:
-
-            return {
-
-                "status": "rejected",
-
-                "reason": "Symbol not found",
-
-                "execution_enabled": False
-
-            }
-
-        filters = get_filters(
-            symbol_data
-        )
-
-        lot = filters.get(
-            "LOT_SIZE",
-            {}
-        )
-
-        market_lot = filters.get(
-            "MARKET_LOT_SIZE",
-            {}
-        )
-
-        price_filter = filters.get(
-            "PRICE_FILTER",
-            {}
-        )
-
-        minimum_notional = filters.get(
-            "MIN_NOTIONAL",
-            {}
-        )
-
-        min_qty = float(
-            lot.get("minQty", 0)
-        )
-
-        max_qty = float(
-            lot.get("maxQty", 0)
-        )
-
-        step = float(
-            lot.get("stepSize", 0)
-        )
-
-        market_min = float(
-            market_lot.get("minQty", 0)
-        )
-
-        market_max = float(
-            market_lot.get("maxQty", 0)
-        )
-
-        market_step = float(
-            market_lot.get("stepSize", 0)
-        )
-
-        min_price = float(
-            price_filter.get("minPrice", 0)
-        )
-
-        max_price = float(
-            price_filter.get("maxPrice", 0)
-        )
-
-        tick = float(
-            price_filter.get("tickSize", 0)
-        )
-
-        min_notional = float(
-            minimum_notional.get(
-                "notional",
-                minimum_notional.get("minNotional", 0)
-            )
-        )
-
-        notional = quantity * price
-
+        symbol = symbol.upper()
+        data = get_symbol_info(client, symbol)
+        if not data:
+            return {"status": "rejected", "reason": "Symbol not found", "execution_enabled": False}
+        filters = get_filters(data)
+        lot, market_lot, price_filter = filters.get("LOT_SIZE", {}), filters.get("MARKET_LOT_SIZE", {}), filters.get("PRICE_FILTER", {})
+        notional_filter = filters.get("MIN_NOTIONAL", filters.get("NOTIONAL", {}))
+        min_notional = float(notional_filter.get("notional", notional_filter.get("minNotional", 0)))
         checks = {
-
-            "symbol_trading":
-                symbol_data.get("status") == "TRADING",
-
-            "lot_size_valid":
-                min_qty <= quantity <= max_qty
-                and check_step(quantity, step),
-
-            "market_lot_size_valid":
-                market_min <= quantity <= market_max
-                and check_step(quantity, market_step),
-
-            "price_filter_valid":
-                min_price <= price <= max_price
-                and check_step(price, tick),
-
-            "minimum_notional_valid":
-                notional >= min_notional
-
+            "symbol_trading": data.get("status") == "TRADING",
+            "lot_size_valid": float(lot.get("minQty", 0)) <= quantity <= float(lot.get("maxQty", 0)) and check_step(quantity, float(lot.get("stepSize", 0))),
+            "market_lot_size_valid": float(market_lot.get("minQty", 0)) <= quantity <= float(market_lot.get("maxQty", 0)) and check_step(quantity, float(market_lot.get("stepSize", 0))),
+            "price_filter_valid": float(price_filter.get("minPrice", 0)) <= price <= float(price_filter.get("maxPrice", 0)) and check_step(price, float(price_filter.get("tickSize", 0))),
+            "minimum_notional_valid": quantity * price >= min_notional,
         }
+        return {"status": "validated" if all(checks.values()) else "rejected", "symbol": symbol, "quantity": quantity, "price": price, "notional": quantity * price, "checks": checks, "all_checks_passed": all(checks.values()), "execution_enabled": False}
+    except Exception as exc:
+        return {"status": "error", "error": str(exc), "execution_enabled": False}
 
-        passed = all(
-            checks.values()
-        )
-
-        return {
-
-            "status": (
-                "validated"
-                if passed
-                else "rejected"
-            ),
-
-            "symbol": symbol.upper(),
-
-            "quantity": quantity,
-
-            "price": price,
-
-            "notional": notional,
-
-            "checks": checks,
-
-            "all_checks_passed": passed,
-
-            "execution_enabled": False
-
-        }
-
-    except Exception as e:
-
-        return {
-
-            "status": "error",
-
-            "error": str(e),
-
-            "execution_enabled": False
-
-        }
-
-
-# =========================================================
-# VALIDATE-ONLY ENDPOINT
-# =========================================================
 
 @app.post("/validate-signal")
 async def validate_only(request: Request):
     try:
         body = await request.body()
         signal, error = parse_signal(body.decode("utf-8"))
-
         if error:
-            return JSONResponse(status_code=400, content={
-                "status": "rejected", "reason": error,
-                "execution_enabled": EXECUTION_ENABLED
-            })
-
-        account_results = []
-        for account_number in (1, 2):
-            result = validate_signal(signal, account_number=account_number)
-            account_results.append(result)
-
-        response = {
-            "status": "multi_account_validation",
-            "signal": signal,
-            "accounts": account_results,
-            "execution_enabled": EXECUTION_ENABLED
-        }
-
-        log_event({"event": "multi_account_validate_only", "signal": signal, "results": account_results})
-        return response
-
-    except Exception as e:
-        return JSONResponse(status_code=400, content={
-            "status": "error", "detail": str(e),
-            "execution_enabled": EXECUTION_ENABLED
-        })
-
-
-# =========================================================
-# DEMO EXECUTION WEBHOOK
-# =========================================================
-
-EXECUTION_ENABLED = False  # HARD DISABLED during Binance order-error diagnosis
-
-def process_demo_signal(signal, fingerprint):
-    """Safety-first demo execution worker. It remains unreachable while execution is disabled."""
-    results = []
-    any_completed = False
-
-    for account_number in (1, 2):
-        item = {"account": f"Account {account_number}", "status": "started"}
-        client = None
-        entry_attempted = False
-        try:
-            # Validate, including One-Way mode and no existing position, before changing leverage.
-            validation = validate_signal(signal, account_number)
-            item["validation"] = validation
-            if not validation.get("ready"):
-                item["status"] = "rejected_by_validation"
-                results.append(item)
-                continue
-
-            client = BinanceClient(account_number)
-            mode = client.get_position_mode()
-            if mode.get("dualSidePosition"):
-                item["status"] = "rejected_hedge_mode"
-                item["reason"] = "One-Way Mode required; no order was submitted."
-                results.append(item)
-                continue
-
-            # Recheck position immediately before configuration/order submission.
-            if client.get_open_position(TARGET_SYMBOL):
-                item["status"] = "rejected_position_recheck"
-                item["reason"] = "Position detected on final pre-entry recheck."
-                results.append(item)
-                continue
-
-            leverage_result = client.apply_and_verify_leverage(TARGET_SYMBOL, signal["leverage"])
-            item["leverage"] = leverage_result
-
-            entry_side = "BUY" if signal["side"] == "LONG" else "SELL"
-            exit_side = "SELL" if entry_side == "BUY" else "BUY"
-            entry_attempted = True
-            entry_order = client.place_market_order(TARGET_SYMBOL, entry_side, signal["quantity"])
-            item["entry_order"] = entry_order
-
-            # Confirm the entry with bounded retries. An uncertain entry is not assumed flat.
-            position, confirmation = confirm_position_with_retries(client, TARGET_SYMBOL)
-            item["entry_confirmation_retry"] = confirmation
-            if not position:
-                item["status"] = "CRITICAL_entry_uncertain_recovery_required"
-                item["reason"] = "Entry response received but position was not confirmed after retries; do not assume the account is flat."
-                # If Binance returned an order ID, query its state before ending recovery.
-                order_id = entry_order.get("orderId") if isinstance(entry_order, dict) else None
-                if order_id is not None:
-                    try:
-                        item["entry_order_status"] = client.get_order(TARGET_SYMBOL, order_id)
-                    except Exception as order_query_error:
-                        item["entry_order_query_error"] = str(order_query_error)
-                # One additional position read after order-state query; close any confirmed exposure.
-                try:
-                    recovery_position = client.get_open_position(TARGET_SYMBOL)
-                    if recovery_position and abs(float(recovery_position.get("positionAmt", 0))) > 0:
-                        recovery_amt = float(recovery_position.get("positionAmt", 0))
-                        recovery_side = "SELL" if recovery_amt > 0 else "BUY"
-                        item["recovery_position"] = recovery_position
-                        item["recovery_close_attempt"] = client.close_position_market(TARGET_SYMBOL, recovery_side)
-                        item["status"] = "CRITICAL_uncertain_entry_close_attempted"
-                except Exception as recovery_error:
-                    item["recovery_error"] = str(recovery_error)
-                results.append(item)
-                continue
-
-            position_amt = float(position.get("positionAmt", 0))
-            actual_quantity = abs(position_amt)
-            actual_entry = float(position.get("entryPrice", 0))
-            actual_exit_side = "SELL" if position_amt > 0 else "BUY"
-            item["position_confirmation"] = {
-                "position_amount": position_amt,
-                "actual_quantity": actual_quantity,
-                "actual_entry_price": actual_entry
-            }
-
-            if actual_entry <= 0:
-                item["status"] = "critical_entry_price_unavailable"
-                item["reason"] = "Position confirmed, but entry price was invalid; emergency close attempted."
-                item["emergency_close"] = client.close_position_market(TARGET_SYMBOL, actual_exit_side)
-                results.append(item)
-                continue
-
-            # Recalculate risk against actual entry, wallet, quantity and signal stop.
-            account = client.get_account()
-            wallet = float(account.get("totalWalletBalance", 0))
-            actual_stop_distance = abs(actual_entry - float(signal["sl"]))
-            actual_loss_estimate = actual_stop_distance * actual_quantity
-            actual_risk_pct = actual_loss_estimate / wallet * 100 if wallet > 0 else float("inf")
-            item["actual_risk_check"] = {
-                "entry_price": actual_entry,
-                "quantity": actual_quantity,
-                "stop_price": signal["sl"],
-                "estimated_loss": actual_loss_estimate,
-                "wallet_balance": wallet,
-                "risk_percent": actual_risk_pct,
-                "limit_percent": RISK_LIMIT_PERCENT
-            }
-
-            if wallet <= 0 or actual_risk_pct > RISK_LIMIT_PERCENT:
-                item["status"] = "risk_exceeded_after_fill_emergency_close"
-                item["emergency_close"] = client.close_position_market(TARGET_SYMBOL, actual_exit_side)
-                results.append(item)
-                continue
-
-            placed_protection = []
-            try:
-                # Place SL first so downside protection is prioritized.
-                sl_order = client.place_close_position_order(
-                    TARGET_SYMBOL, actual_exit_side, "STOP_MARKET", signal["sl"]
-                )
-                placed_protection.append(sl_order)
-                item["stop_loss_order"] = sl_order
-
-                tp_order = client.place_close_position_order(
-                    TARGET_SYMBOL, actual_exit_side, "TAKE_PROFIT_MARKET", signal["tp"]
-                )
-                placed_protection.append(tp_order)
-                item["take_profit_order"] = tp_order
-                protection_verification = verify_protective_algos(
-                    client, TARGET_SYMBOL, sl_order, tp_order, signal["sl"], signal["tp"]
-                )
-                item["protection_verification"] = protection_verification
-                if not protection_verification.get("verified"):
-                    raise RuntimeError("Both protective Algo orders could not be verified as open on Binance")
-                item["status"] = "demo_trade_open_with_verified_protection"
-                any_completed = True
-
-            except Exception as protection_error:
-                item["protection_error"] = str(protection_error)
-                item["status"] = "protection_failed_cleanup_attempted"
-                # Cancel any conditional protection already accepted, then attempt to flatten.
-                cleanup_results = []
-                for order in placed_protection:
-                    algo_id = order.get("algoId") if isinstance(order, dict) else None
-                    if algo_id is not None:
-                        try:
-                            cleanup_results.append(client.cancel_algo_order(TARGET_SYMBOL, algo_id))
-                        except Exception as cleanup_error:
-                            cleanup_results.append({"cancel_error": str(cleanup_error), "algoId": algo_id})
-                item["protection_cleanup"] = cleanup_results
-                try:
-                    item["emergency_close"] = client.close_position_market(TARGET_SYMBOL, actual_exit_side)
-                    item["status"] = "protection_failed_emergency_close_attempted"
-                except Exception as close_error:
-                    item["emergency_close_error"] = str(close_error)
-                    item["status"] = "CRITICAL_protection_cleanup_and_close_failed"
-
-            results.append(item)
-
-        except Exception as account_error:
-            item["status"] = "account_error"
-            item["error"] = str(account_error)
-            # Do not assume exposure is absent after an entry request was attempted.
-            if entry_attempted and client is not None:
-                try:
-                    position = client.get_open_position(TARGET_SYMBOL)
-                    if position:
-                        amt = float(position.get("positionAmt", 0))
-                        if amt:
-                            close_side = "SELL" if amt > 0 else "BUY"
-                            item["recovery_position_check"] = position
-                            item["recovery_close_attempt"] = client.close_position_market(TARGET_SYMBOL, close_side)
-                except Exception as recovery_error:
-                    item["recovery_error"] = str(recovery_error)
-                    item["status"] = "CRITICAL_account_error_and_recovery_failed"
-            results.append(item)
-
-    log_event({"event": "background_demo_execution_finished", "fingerprint": fingerprint, "signal": signal, "accounts": results, "any_completed": any_completed})
+            return JSONResponse(status_code=400, content={"status": "rejected", "reason": error, "execution_enabled": False})
+        results = [validate_signal(signal, account_number=n) for n in (1, 2)]
+        return {"status": "multi_account_validation", "signal": signal, "accounts": results, "execution_enabled": False}
+    except Exception as exc:
+        return JSONResponse(status_code=400, content={"status": "error", "detail": str(exc), "execution_enabled": False})
 
 
 @app.post("/webhook")
-async def webhook(request: Request, background_tasks: BackgroundTasks):
+async def webhook(request: Request):
     try:
-        body = await request.body()
-        raw_body = body.decode("utf-8").strip()
-
-        # Dedicated keep-alive payload: never parse as a trade or contact Binance.
+        raw_body = (await request.body()).decode("utf-8").strip()
         try:
-            keepalive_payload = json.loads(raw_body)
+            payload = json.loads(raw_body)
         except json.JSONDecodeError:
-            keepalive_payload = None
+            payload = None
 
-        if isinstance(keepalive_payload, dict) and str(keepalive_payload.get("type", "")).upper() == "KEEPALIVE":
-            log_event({"event": "keepalive_received", "source": keepalive_payload.get("source", "unknown")})
-            return JSONResponse(status_code=200, content={
-                "status": "keepalive_received",
-                "trading": False,
-                "binance_contacted": False
-            })
+        if isinstance(payload, dict) and str(payload.get("type", "")).upper() == "KEEPALIVE":
+            log_event({"event": "keepalive_received", "source": payload.get("source", "unknown")})
+            return JSONResponse(status_code=200, content={"status": "keepalive_received", "trading": False, "binance_contacted": False})
 
-        if not EXECUTION_ENABLED:
-            return JSONResponse(status_code=503, content={"status": "execution_disabled", "execution_enabled": False})
-
-        signal, error = parse_signal(raw_body)
-        if error:
-            return JSONResponse(status_code=400, content={"status": "rejected", "reason": error})
-
-        fingerprint = signal_fingerprint(signal)
-        now = time.time()
-        for key, timestamp in list(SEEN_SIGNALS.items()):
-            if now - timestamp > DUPLICATE_WINDOW_SECONDS:
-                SEEN_SIGNALS.pop(key, None)
-        if fingerprint in SEEN_SIGNALS:
-            return JSONResponse(status_code=409, content={"status": "duplicate_rejected"})
-
-        # Reserve fingerprint immediately so concurrent/repeated webhook calls don't enqueue twice.
-        SEEN_SIGNALS[fingerprint] = now
-        background_tasks.add_task(process_demo_signal, signal, fingerprint)
-        return JSONResponse(status_code=202, content={
-            "status": "accepted_for_background_demo_processing",
-            "signal": signal,
-            "accounts": ["Account 1", "Account 2"],
-            "execution_enabled": True,
-            "mode": "BINANCE_FUTURES_DEMO_ONLY",
-            "message": "Signal accepted. Background processing started after acknowledgement."
+        # Intentionally non-executable in this release.
+        return JSONResponse(status_code=503, content={
+            "status": "execution_disabled",
+            "execution_enabled": False,
+            "mode": "VALIDATION_ONLY",
+            "message": "Trade webhooks are disabled in this safety revision."
         })
-    except Exception as e:
-        log_event({"event": "webhook_error", "error": str(e)})
-        return JSONResponse(status_code=400, content={"status": "error", "detail": str(e)})
+    except Exception as exc:
+        log_event({"event": "webhook_error", "error": str(exc)})
+        return JSONResponse(status_code=400, content={"status": "error", "detail": str(exc), "execution_enabled": False})
