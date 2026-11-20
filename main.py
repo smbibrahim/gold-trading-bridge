@@ -1203,6 +1203,8 @@ def process_demo_signal(signal, fingerprint):
 
             item["position"] = position
             try:
+                # Conditional protection orders use Binance's Algo Order API
+                # through place_close_position_order (triggerPrice, not stopPrice).
                 sl_order = client.place_close_position_order(TARGET_SYMBOL, exit_side, "STOP_MARKET", signal["sl"])
                 tp_order = client.place_close_position_order(TARGET_SYMBOL, exit_side, "TAKE_PROFIT_MARKET", signal["tp"])
                 item["stop_loss_order"] = sl_order
