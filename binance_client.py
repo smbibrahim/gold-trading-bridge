@@ -92,3 +92,37 @@ class BinanceClient:
             "requested_leverage": leverage,
             "applied_leverage": applied_leverage
         }
+
+
+    def place_market_order(self, symbol, side, quantity):
+        return self._signed_request("POST", "/fapi/v1/order", {
+            "symbol": symbol, "side": side.upper(), "type": "MARKET",
+            "quantity": str(quantity), "newOrderRespType": "RESULT"
+        })
+
+    def place_close_position_order(self, symbol, side, order_type, stop_price):
+        if order_type not in ("STOP_MARKET", "TAKE_PROFIT_MARKET"):
+            raise ValueError("Unsupported protective order type")
+        return self._signed_request("POST", "/fapi/v1/order", {
+            "symbol": symbol, "side": side.upper(), "type": order_type,
+            "stopPrice": str(stop_price), "closePosition": "true",
+            "workingType": "MARK_PRICE", "priceProtect": "true"
+        })
+
+    def get_open_position(self, symbol):
+        positions = self.get_position_risk(symbol)
+        if isinstance(positions, list):
+            for position in positions:
+                if position.get("symbol") == symbol and abs(float(position.get("positionAmt", 0))) > 0:
+                    return position
+        return None
+
+    def close_position_market(self, symbol, side):
+        position = self.get_open_position(symbol)
+        if not position:
+            return {"status":"already_flat"}
+        quantity = abs(float(position.get("positionAmt", 0)))
+        return self._signed_request("POST", "/fapi/v1/order", {
+            "symbol": symbol, "side": side.upper(), "type":"MARKET",
+            "quantity":str(quantity), "reduceOnly":"true", "newOrderRespType":"RESULT"
+        })
