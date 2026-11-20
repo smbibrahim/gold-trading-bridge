@@ -1,5 +1,3 @@
-
-import os
 import re
 from fastapi import FastAPI, Request
 from fastapi.responses import JSONResponse
@@ -14,13 +12,36 @@ async def home():
     return {
         "status": "online",
         "service": "Gold Trading Bridge",
-        "mode": "binance-connection-test"
+        "mode": "binance-demo-testing"
     }
 
 
 @app.get("/health")
 async def health():
     return {"status": "healthy"}
+
+
+@app.get("/test-connections")
+async def test_connections():
+    results = []
+
+    for account_number in (1, 2):
+        try:
+            client = BinanceClient(account_number)
+            result = client.test_connection()
+            results.append(result)
+
+        except Exception as e:
+            results.append({
+                "account": f"Account {account_number}",
+                "status": "error",
+                "error": str(e)
+            })
+
+    return {
+        "accounts": results,
+        "execution_enabled": False
+    }
 
 
 def extract_field(message, label):
@@ -30,11 +51,9 @@ def extract_field(message, label):
 
 
 def parse_signal(message):
-    message_upper = message.upper()
-
-    if "LONG ENTRY" in message_upper:
+    if "LONG ENTRY" in message.upper():
         side = "LONG"
-    elif "SHORT ENTRY" in message_upper:
+    elif "SHORT ENTRY" in message.upper():
         side = "SHORT"
     else:
         return None, "Entry signal not detected"
@@ -101,40 +120,8 @@ def parse_signal(message):
     return signal, None
 
 
-@app.get("/test-binance")
-async def test_binance():
-
-    key = os.getenv("BINANCE_API_KEY_1")
-    secret = os.getenv("BINANCE_API_SECRET_1")
-
-    if not key or not secret:
-        return JSONResponse(
-            status_code=400,
-            content={
-                "status": "not_configured",
-                "account": "Account 1"
-            }
-        )
-
-    try:
-        client = BinanceClient()
-        result = client.test_connection()
-
-        return result
-
-    except Exception as e:
-        return JSONResponse(
-            status_code=500,
-            content={
-                "status": "error",
-                "detail": str(e)
-            }
-        )
-
-
 @app.post("/webhook")
 async def webhook(request: Request):
-
     try:
         body = await request.body()
         message = body.decode("utf-8").strip()
@@ -152,41 +139,12 @@ async def webhook(request: Request):
                 }
             )
 
-        account_1_configured = bool(
-            os.getenv("BINANCE_API_KEY_1")
-            and os.getenv("BINANCE_API_SECRET_1")
-        )
-
-        account_2_configured = bool(
-            os.getenv("BINANCE_API_KEY_2")
-            and os.getenv("BINANCE_API_SECRET_2")
-        )
-
         return JSONResponse(
             content={
                 "status": "signal_validated",
                 "signal": signal,
-                "accounts": [
-                    {
-                        "account": "Account 1",
-                        "status": (
-                            "credentials_configured"
-                            if account_1_configured
-                            else "not_configured"
-                        ),
-                        "execution": "disabled"
-                    },
-                    {
-                        "account": "Account 2",
-                        "status": (
-                            "credentials_configured"
-                            if account_2_configured
-                            else "not_configured"
-                        ),
-                        "execution": "disabled"
-                    }
-                ],
-                "execution_enabled": False
+                "execution_enabled": False,
+                "message": "Signal validated. No orders placed."
             }
         )
 
