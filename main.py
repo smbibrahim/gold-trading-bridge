@@ -1162,7 +1162,7 @@ async def validate_only(request: Request):
 # DEMO EXECUTION WEBHOOK
 # =========================================================
 
-EXECUTION_ENABLED = os.getenv("EXECUTION_ENABLED", "false").lower() == "true"
+EXECUTION_ENABLED = False  # HARD DISABLED during Binance order-error diagnosis
 
 def process_demo_signal(signal, fingerprint):
     """Run demo-only execution after the webhook has been acknowledged."""
