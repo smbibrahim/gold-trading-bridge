@@ -1,4 +1,3 @@
-
 import os
 import time
 import hmac
@@ -19,8 +18,6 @@ class BinanceClient:
         self.api_secret = os.getenv(
             f"BINANCE_API_SECRET_{account_number}"
         )
-
-        self.connected = False
 
         if not self.api_key or not self.api_secret:
             raise ValueError(
@@ -58,31 +55,25 @@ class BinanceClient:
         return response.json()
 
     def test_connection(self):
-        try:
-            result = self._signed_request(
-                "GET",
-                "/fapi/v2/account"
+        result = self._signed_request(
+            "GET",
+            "/fapi/v2/account"
+        )
+
+        return {
+            "status": "connected",
+            "account": f"Account {self.account_number}",
+            "can_trade": result.get("canTrade"),
+            "available_balance": result.get(
+                "availableBalance"
             )
+        }
 
-            self.connected = True
-
-            return {
-                "status": "connected",
-                "account": f"Account {self.account_number}",
-                "can_trade": result.get("canTrade"),
-                "available_balance": result.get(
-                    "availableBalance"
-                )
-            }
-
-        except Exception as e:
-            self.connected = False
-
-            return {
-                "status": "connection_failed",
-                "account": f"Account {self.account_number}",
-                "error": str(e)
-            }
+    def get_account(self):
+        return self._signed_request(
+            "GET",
+            "/fapi/v2/account"
+        )
 
     def get_exchange_info(self):
         response = self.session.get(
@@ -93,14 +84,12 @@ class BinanceClient:
         response.raise_for_status()
         return response.json()
 
-    # READ-ONLY: Current position mode
     def get_position_mode(self):
         return self._signed_request(
             "GET",
             "/fapi/v1/positionSide/dual"
         )
 
-    # READ-ONLY: Current position information
     def get_position_risk(self, symbol=None):
         params = {}
 
@@ -113,7 +102,6 @@ class BinanceClient:
             params
         )
 
-    # READ-ONLY: Leverage bracket information
     def get_leverage_brackets(self, symbol=None):
         params = {}
 
@@ -126,7 +114,6 @@ class BinanceClient:
             params
         )
 
-    # CONFIGURATION: Set leverage
     def set_leverage(self, symbol, leverage):
         leverage = int(leverage)
 
@@ -135,7 +122,7 @@ class BinanceClient:
                 "Leverage must be between 1 and 125"
             )
 
-        result = self._signed_request(
+        return self._signed_request(
             "POST",
             "/fapi/v1/leverage",
             {
@@ -144,9 +131,6 @@ class BinanceClient:
             }
         )
 
-        return result
-
-    # CONFIGURATION: Set and verify leverage
     def apply_and_verify_leverage(self, symbol, leverage):
         leverage = int(leverage)
 
@@ -159,9 +143,9 @@ class BinanceClient:
 
         if applied_leverage != leverage:
             raise RuntimeError(
-                f"Leverage verification failed. "
-                f"Requested {leverage}x, "
-                f"returned {applied_leverage}x"
+                f"Leverage verification failed: "
+                f"requested {leverage}, "
+                f"received {applied_leverage}"
             )
 
         return {
