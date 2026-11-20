@@ -544,6 +544,19 @@ def validate_signal(signal, account_number=1):
             )
 
         # -------------------------------------------------
+        # POSITION MODE CHECK (closePosition Algo protection requires One-Way mode)
+        # -------------------------------------------------
+
+        position_mode = client.get_position_mode()
+        one_way_mode_valid = not bool(position_mode.get("dualSidePosition", False))
+        results["position_mode"] = position_mode
+        results["checks"]["one_way_mode_valid"] = one_way_mode_valid
+        if not one_way_mode_valid:
+            results["reasons"].append(
+                "Hedge Mode detected; One-Way Mode is required for this bridge's close-position protection"
+            )
+
+        # -------------------------------------------------
         # LEVERAGE BRACKET CHECK
         # -------------------------------------------------
 
@@ -708,12 +721,18 @@ def validate_signal(signal, account_number=1):
             )
 
         # -------------------------------------------------
-        # DUPLICATE CHECK
+        # DUPLICATE CHECK (read-only; does not reserve a signal)
         # -------------------------------------------------
 
-        results["checks"]["duplicate_signal"] = (
-            True
-        )
+        fingerprint = signal_fingerprint(signal)
+        now = time.time()
+        for key, timestamp in list(SEEN_SIGNALS.items()):
+            if now - timestamp > DUPLICATE_WINDOW_SECONDS:
+                SEEN_SIGNALS.pop(key, None)
+        duplicate_signal = fingerprint in SEEN_SIGNALS
+        results["checks"]["duplicate_signal"] = not duplicate_signal
+        if duplicate_signal:
+            results["reasons"].append("Signal fingerprint was already accepted recently")
 
         # -------------------------------------------------
         # FINAL RESULT
@@ -1165,12 +1184,16 @@ async def validate_only(request: Request):
 EXECUTION_ENABLED = False  # HARD DISABLED during Binance order-error diagnosis
 
 def process_demo_signal(signal, fingerprint):
-    """Run demo-only execution after the webhook has been acknowledged."""
+    """Safety-first demo execution worker. It remains unreachable while execution is disabled."""
     results = []
     any_completed = False
+
     for account_number in (1, 2):
         item = {"account": f"Account {account_number}", "status": "started"}
+        client = None
+        entry_attempted = False
         try:
+            # Validate, including One-Way mode and no existing position, before changing leverage.
             validation = validate_signal(signal, account_number)
             item["validation"] = validation
             if not validation.get("ready"):
@@ -1179,50 +1202,131 @@ def process_demo_signal(signal, fingerprint):
                 continue
 
             client = BinanceClient(account_number)
-            lev = client.apply_and_verify_leverage(TARGET_SYMBOL, signal["leverage"])
-            item["leverage"] = lev
-
-            # Explicitly require One-Way mode for closePosition protection.
             mode = client.get_position_mode()
             if mode.get("dualSidePosition"):
                 item["status"] = "rejected_hedge_mode"
-                item["reason"] = "Switch this demo account to One-Way Mode before execution."
+                item["reason"] = "One-Way Mode required; no order was submitted."
                 results.append(item)
                 continue
 
-            side = "BUY" if signal["side"] == "LONG" else "SELL"
-            exit_side = "SELL" if side == "BUY" else "BUY"
-            entry_order = client.place_market_order(TARGET_SYMBOL, side, signal["quantity"])
+            # Recheck position immediately before configuration/order submission.
+            if client.get_open_position(TARGET_SYMBOL):
+                item["status"] = "rejected_position_recheck"
+                item["reason"] = "Position detected on final pre-entry recheck."
+                results.append(item)
+                continue
+
+            leverage_result = client.apply_and_verify_leverage(TARGET_SYMBOL, signal["leverage"])
+            item["leverage"] = leverage_result
+
+            entry_side = "BUY" if signal["side"] == "LONG" else "SELL"
+            exit_side = "SELL" if entry_side == "BUY" else "BUY"
+            entry_attempted = True
+            entry_order = client.place_market_order(TARGET_SYMBOL, entry_side, signal["quantity"])
             item["entry_order"] = entry_order
 
+            # Confirm position from Binance and use actual fill/position values.
             position = client.get_open_position(TARGET_SYMBOL)
             if not position or abs(float(position.get("positionAmt", 0))) <= 0:
                 item["status"] = "entry_not_confirmed"
+                item["reason"] = "Market order response received, but live position snapshot did not confirm exposure."
                 results.append(item)
                 continue
 
-            item["position"] = position
+            position_amt = float(position.get("positionAmt", 0))
+            actual_quantity = abs(position_amt)
+            actual_entry = float(position.get("entryPrice", 0))
+            actual_exit_side = "SELL" if position_amt > 0 else "BUY"
+            item["position_confirmation"] = {
+                "position_amount": position_amt,
+                "actual_quantity": actual_quantity,
+                "actual_entry_price": actual_entry
+            }
+
+            if actual_entry <= 0:
+                item["status"] = "critical_entry_price_unavailable"
+                item["reason"] = "Position confirmed, but entry price was invalid; emergency close attempted."
+                item["emergency_close"] = client.close_position_market(TARGET_SYMBOL, actual_exit_side)
+                results.append(item)
+                continue
+
+            # Recalculate risk against actual entry, wallet, quantity and signal stop.
+            account = client.get_account()
+            wallet = float(account.get("totalWalletBalance", 0))
+            actual_stop_distance = abs(actual_entry - float(signal["sl"]))
+            actual_loss_estimate = actual_stop_distance * actual_quantity
+            actual_risk_pct = actual_loss_estimate / wallet * 100 if wallet > 0 else float("inf")
+            item["actual_risk_check"] = {
+                "entry_price": actual_entry,
+                "quantity": actual_quantity,
+                "stop_price": signal["sl"],
+                "estimated_loss": actual_loss_estimate,
+                "wallet_balance": wallet,
+                "risk_percent": actual_risk_pct,
+                "limit_percent": RISK_LIMIT_PERCENT
+            }
+
+            if wallet <= 0 or actual_risk_pct > RISK_LIMIT_PERCENT:
+                item["status"] = "risk_exceeded_after_fill_emergency_close"
+                item["emergency_close"] = client.close_position_market(TARGET_SYMBOL, actual_exit_side)
+                results.append(item)
+                continue
+
+            placed_protection = []
             try:
-                # Conditional protection orders use Binance's Algo Order API
-                # through place_close_position_order (triggerPrice, not stopPrice).
-                sl_order = client.place_close_position_order(TARGET_SYMBOL, exit_side, "STOP_MARKET", signal["sl"])
-                tp_order = client.place_close_position_order(TARGET_SYMBOL, exit_side, "TAKE_PROFIT_MARKET", signal["tp"])
+                # Place SL first so downside protection is prioritized.
+                sl_order = client.place_close_position_order(
+                    TARGET_SYMBOL, actual_exit_side, "STOP_MARKET", signal["sl"]
+                )
+                placed_protection.append(sl_order)
                 item["stop_loss_order"] = sl_order
+
+                tp_order = client.place_close_position_order(
+                    TARGET_SYMBOL, actual_exit_side, "TAKE_PROFIT_MARKET", signal["tp"]
+                )
+                placed_protection.append(tp_order)
                 item["take_profit_order"] = tp_order
                 item["status"] = "demo_trade_open_with_protection"
                 any_completed = True
+
             except Exception as protection_error:
                 item["protection_error"] = str(protection_error)
+                item["status"] = "protection_failed_cleanup_attempted"
+                # Cancel any conditional protection already accepted, then attempt to flatten.
+                cleanup_results = []
+                for order in placed_protection:
+                    algo_id = order.get("algoId") if isinstance(order, dict) else None
+                    if algo_id is not None:
+                        try:
+                            cleanup_results.append(client.cancel_algo_order(TARGET_SYMBOL, algo_id))
+                        except Exception as cleanup_error:
+                            cleanup_results.append({"cancel_error": str(cleanup_error), "algoId": algo_id})
+                item["protection_cleanup"] = cleanup_results
                 try:
-                    item["emergency_close"] = client.close_position_market(TARGET_SYMBOL, exit_side)
-                    item["status"] = "emergency_close_attempted_protection_failed"
+                    item["emergency_close"] = client.close_position_market(TARGET_SYMBOL, actual_exit_side)
+                    item["status"] = "protection_failed_emergency_close_attempted"
                 except Exception as close_error:
                     item["emergency_close_error"] = str(close_error)
-                    item["status"] = "CRITICAL_protection_and_close_failed"
+                    item["status"] = "CRITICAL_protection_cleanup_and_close_failed"
+
             results.append(item)
+
         except Exception as account_error:
             item["status"] = "account_error"
             item["error"] = str(account_error)
+            # Do not assume exposure is absent after an entry request was attempted.
+            if entry_attempted and client is not None:
+                try:
+                    position = client.get_open_position(TARGET_SYMBOL)
+                    if position:
+                        amt = float(position.get("positionAmt", 0))
+                        if amt:
+                            close_side = "SELL" if amt > 0 else "BUY"
+                            item["recovery_position_check"] = position
+                            item["recovery_close_attempt"] = client.close_position_market(TARGET_SYMBOL, close_side)
+                except Exception as recovery_error:
+                    item["recovery_error"] = str(recovery_error)
+                    item["status"] = "CRITICAL_account_error_and_recovery_failed"
             results.append(item)
 
     log_event({"event": "background_demo_execution_finished", "fingerprint": fingerprint, "signal": signal, "accounts": results, "any_completed": any_completed})
