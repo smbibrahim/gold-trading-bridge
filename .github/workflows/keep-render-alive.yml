@@ -6,12 +6,10 @@ on:
   workflow_dispatch:
 
 jobs:
-  ping-render:
+  ping:
     runs-on: ubuntu-latest
+
     steps:
-      - name: Send harmless keep-alive payload to Render webhook
+      - name: Ping Render
         run: |
-          curl --fail --silent --show-error --max-time 20 \
-            -X POST https://gold-trading-bridge-sg.onrender.com/webhook \
-            -H 'Content-Type: application/json' \
-            -d '{"type":"KEEPALIVE","source":"github-actions"}'
+          curl -sS https://gold-trading-bridge-sg.onrender.com/health
