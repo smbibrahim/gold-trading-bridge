@@ -1,10 +1,8 @@
-import os
+
 from fastapi import FastAPI, Request
 from fastapi.responses import JSONResponse
 
 app = FastAPI(title="Gold Trading Bridge")
-
-WEBHOOK_SECRET = os.getenv("WEBHOOK_SECRET")
 
 
 @app.get("/")
@@ -22,20 +20,7 @@ async def health():
 
 
 @app.post("/webhook")
-async def webhook(secret: str, request: Request):
-
-    if not WEBHOOK_SECRET:
-        return JSONResponse(
-            status_code=500,
-            content={"status": "error", "detail": "Webhook secret not configured"}
-        )
-
-    if secret != WEBHOOK_SECRET:
-        return JSONResponse(
-            status_code=401,
-            content={"status": "error", "detail": "Unauthorized"}
-        )
-
+async def webhook(request: Request):
     try:
         body = await request.body()
         message = body.decode("utf-8")
