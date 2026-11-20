@@ -1,9 +1,12 @@
+
 import os
 import re
 from fastapi import FastAPI, Request
 from fastapi.responses import JSONResponse
 
-app = FastAPI(title="Gold Trading Bridge - Multi Account")
+from binance_client import BinanceClient
+
+app = FastAPI(title="Gold Trading Bridge")
 
 
 @app.get("/")
@@ -11,7 +14,7 @@ async def home():
     return {
         "status": "online",
         "service": "Gold Trading Bridge",
-        "mode": "multi-account-test"
+        "mode": "binance-connection-test"
     }
 
 
@@ -27,9 +30,11 @@ def extract_field(message, label):
 
 
 def parse_signal(message):
-    if "LONG ENTRY" in message.upper():
+    message_upper = message.upper()
+
+    if "LONG ENTRY" in message_upper:
         side = "LONG"
-    elif "SHORT ENTRY" in message.upper():
+    elif "SHORT ENTRY" in message_upper:
         side = "SHORT"
     else:
         return None, "Entry signal not detected"
@@ -67,8 +72,8 @@ def parse_signal(message):
 
         leverage = int(
             "".join(
-                character for character in signal["leverage"]
-                if character.isdigit()
+                c for c in signal["leverage"]
+                if c.isdigit()
             )
         )
 
@@ -96,23 +101,45 @@ def parse_signal(message):
     return signal, None
 
 
-def account_status(account_number):
-    api_key = os.getenv(f"BINANCE_API_KEY_{account_number}")
-    api_secret = os.getenv(f"BINANCE_API_SECRET_{account_number}")
+@app.get("/test-binance")
+async def test_binance():
 
-    if api_key and api_secret:
-        return "credentials_configured"
+    key = os.getenv("BINANCE_API_KEY_1")
+    secret = os.getenv("BINANCE_API_SECRET_1")
 
-    return "not_configured"
+    if not key or not secret:
+        return JSONResponse(
+            status_code=400,
+            content={
+                "status": "not_configured",
+                "account": "Account 1"
+            }
+        )
+
+    try:
+        client = BinanceClient()
+        result = client.test_connection()
+
+        return result
+
+    except Exception as e:
+        return JSONResponse(
+            status_code=500,
+            content={
+                "status": "error",
+                "detail": str(e)
+            }
+        )
 
 
 @app.post("/webhook")
 async def webhook(request: Request):
+
     try:
         body = await request.body()
         message = body.decode("utf-8").strip()
 
-        print("Incoming signal received")
+        print("Incoming signal:", message)
 
         signal, error = parse_signal(message)
 
@@ -125,27 +152,40 @@ async def webhook(request: Request):
                 }
             )
 
-        accounts = []
+        account_1_configured = bool(
+            os.getenv("BINANCE_API_KEY_1")
+            and os.getenv("BINANCE_API_SECRET_1")
+        )
 
-        for account_number in [1, 2]:
-            status = account_status(account_number)
-
-            accounts.append({
-                "account": f"Account {account_number}",
-                "status": status,
-                "execution": "disabled"
-            })
-
-            print(
-                f"Account {account_number}: {status}; "
-                "execution disabled"
-            )
+        account_2_configured = bool(
+            os.getenv("BINANCE_API_KEY_2")
+            and os.getenv("BINANCE_API_SECRET_2")
+        )
 
         return JSONResponse(
             content={
                 "status": "signal_validated",
                 "signal": signal,
-                "accounts": accounts,
+                "accounts": [
+                    {
+                        "account": "Account 1",
+                        "status": (
+                            "credentials_configured"
+                            if account_1_configured
+                            else "not_configured"
+                        ),
+                        "execution": "disabled"
+                    },
+                    {
+                        "account": "Account 2",
+                        "status": (
+                            "credentials_configured"
+                            if account_2_configured
+                            else "not_configured"
+                        ),
+                        "execution": "disabled"
+                    }
+                ],
                 "execution_enabled": False
             }
         )
