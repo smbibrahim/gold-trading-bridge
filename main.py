@@ -1159,278 +1159,90 @@ async def validate_only(request: Request):
 
 
 # =========================================================
-# WEBHOOK
-# VALIDATION + LEVERAGE CONFIGURATION ONLY
+# DEMO EXECUTION WEBHOOK
 # =========================================================
+
+EXECUTION_ENABLED = os.getenv("EXECUTION_ENABLED", "false").lower() == "true"
 
 @app.post("/webhook")
 async def webhook(request: Request):
-
-    try:
-
-        body = await request.body()
-
-        message = body.decode(
-            "utf-8"
-        ).strip()
-
-        signal, error = parse_signal(
-            message
-        )
-
-        if error:
-
-            return JSONResponse(
-
-                status_code=400,
-
-                content={
-
-                    "status": "rejected",
-
-                    "reason": error,
-
-                    "execution_enabled": False
-
-                }
-
-            )
-
-        # Duplicate protection
-        fingerprint = signal_fingerprint(
-            signal
-        )
-
-        now = time.time()
-
-        expired = [
-
-            key for key, timestamp
-            in SEEN_SIGNALS.items()
-
-            if now - timestamp
-            > DUPLICATE_WINDOW_SECONDS
-
-        ]
-
-        for key in expired:
-
-            SEEN_SIGNALS.pop(
-                key,
-                None
-            )
-
-        if fingerprint in SEEN_SIGNALS:
-
-            return JSONResponse(
-
-                status_code=409,
-
-                content={
-
-                    "status": "duplicate_rejected",
-
-                    "reason": (
-                        "Duplicate signal detected "
-                        "within duplicate window"
-                    ),
-
-                    "execution_enabled": False
-
-                }
-
-            )
-
-        # Run pre-trade validation
-        validation = validate_signal(
-            signal,
-            account_number=1
-        )
-
-        if not validation.get("ready"):
-
-            return JSONResponse(
-
-                status_code=400,
-
-                content={
-
-                    "status": "rejected",
-
-                    "signal": signal,
-
-                    "validation": validation,
-
-                    "execution_enabled": False
-
-                }
-
-            )
-
-        # Apply leverage only after validations pass
-        client = BinanceClient(1)
-
-        leverage_result = (
-            client.apply_and_verify_leverage(
-                TARGET_SYMBOL,
-                signal["leverage"]
-            )
-        )
-
-        # Record only after successful validation
-        SEEN_SIGNALS[fingerprint] = time.time()
-
-        result = {
-
-            "status": (
-                "validated_and_leverage_verified"
-            ),
-
-            "signal": signal,
-
-            "validation": validation,
-
-            "leverage_result": (
-                leverage_result
-            ),
-
-            "account": "Account 1",
-
-            "execution_enabled": False,
-
-            "message": (
-                "Validation passed and leverage verified. "
-                "No orders placed."
-            )
-
-        }
-
-        log_event({
-
-            "event": "webhook_validation_passed",
-
-            "signal": signal,
-
-            "result": result
-
-        })
-
-        return result
-
-    except Exception as e:
-
-        log_event({
-
-            "event": "webhook_error",
-
-            "error": str(e)
-
-        })
-
-        return JSONResponse(
-
-            status_code=400,
-
-            content={
-
-                "status": "error",
-
-                "detail": str(e),
-
-                "execution_enabled": False
-
-            }
-
-        )@app.post("/webhook")
-async def webhook(request: Request):
+    if not EXECUTION_ENABLED:
+        return JSONResponse(status_code=503, content={"status":"execution_disabled","execution_enabled":False})
     try:
         body = await request.body()
-        message = body.decode("utf-8").strip()
-        signal, error = parse_signal(message)
-
+        signal, error = parse_signal(body.decode("utf-8").strip())
         if error:
-            return JSONResponse(status_code=400, content={
-                "status": "rejected", "reason": error,
-                "execution_enabled": EXECUTION_ENABLED
-            })
+            return JSONResponse(status_code=400, content={"status":"rejected","reason":error})
 
         fingerprint = signal_fingerprint(signal)
         now = time.time()
-
-        expired = [
-            key for key, timestamp in SEEN_SIGNALS.items()
-            if now - timestamp > DUPLICATE_WINDOW_SECONDS
-        ]
-        for key in expired:
-            SEEN_SIGNALS.pop(key, None)
-
+        for key, timestamp in list(SEEN_SIGNALS.items()):
+            if now - timestamp > DUPLICATE_WINDOW_SECONDS:
+                SEEN_SIGNALS.pop(key, None)
         if fingerprint in SEEN_SIGNALS:
-            return JSONResponse(status_code=409, content={
-                "status": "duplicate_rejected",
-                "reason": "Duplicate signal detected within duplicate window",
-                "execution_enabled": EXECUTION_ENABLED
-            })
+            return JSONResponse(status_code=409, content={"status":"duplicate_rejected"})
 
-        # Independently validate and configure leverage for each account.
-        account_results = []
-        any_account_processed = False
-
+        results = []
+        any_completed = False
         for account_number in (1, 2):
-            account_result = {
-                "account": f"Account {account_number}",
-                "status": "pending",
-                "validation": None,
-                "leverage_result": None,
-                "execution_enabled": EXECUTION_ENABLED
-            }
-
-            validation = validate_signal(signal, account_number=account_number)
-            account_result["validation"] = validation
-
-            if not validation.get("ready"):
-                account_result["status"] = "rejected"
-                account_result["reasons"] = validation.get("reasons", [])
-                account_results.append(account_result)
-                continue
-
+            item = {"account": f"Account {account_number}", "status":"started"}
             try:
+                validation = validate_signal(signal, account_number)
+                item["validation"] = validation
+                if not validation.get("ready"):
+                    item["status"] = "rejected_by_validation"
+                    results.append(item)
+                    continue
+
                 client = BinanceClient(account_number)
-                leverage_result = client.apply_and_verify_leverage(
-                    TARGET_SYMBOL, signal["leverage"]
-                )
-                account_result["leverage_result"] = leverage_result
-                account_result["status"] = "validated_and_leverage_verified"
-                any_account_processed = True
+                lev = client.apply_and_verify_leverage(TARGET_SYMBOL, signal["leverage"])
+                item["leverage"] = lev
+
+                # Explicitly require One-Way mode for this closePosition order design.
+                mode = client.get_position_mode()
+                if mode.get("dualSidePosition"):
+                    item["status"] = "rejected_hedge_mode"
+                    item["reason"] = "Switch this demo account to One-Way Mode before execution."
+                    results.append(item)
+                    continue
+
+                side = "BUY" if signal["side"] == "LONG" else "SELL"
+                exit_side = "SELL" if side == "BUY" else "BUY"
+                entry_order = client.place_market_order(TARGET_SYMBOL, side, signal["quantity"])
+                item["entry_order"] = entry_order
+
+                # Confirm a non-zero position before attaching protection.
+                position = client.get_open_position(TARGET_SYMBOL)
+                if not position or abs(float(position.get("positionAmt", 0))) <= 0:
+                    item["status"] = "entry_not_confirmed"
+                    results.append(item)
+                    continue
+
+                item["position"] = position
+                try:
+                    sl_order = client.place_close_position_order(TARGET_SYMBOL, exit_side, "STOP_MARKET", signal["sl"])
+                    tp_order = client.place_close_position_order(TARGET_SYMBOL, exit_side, "TAKE_PROFIT_MARKET", signal["tp"])
+                    item["stop_loss_order"] = sl_order
+                    item["take_profit_order"] = tp_order
+                    item["status"] = "demo_trade_open_with_protection"
+                    any_completed = True
+                except Exception as protection_error:
+                    item["protection_error"] = str(protection_error)
+                    try:
+                        item["emergency_close"] = client.close_position_market(TARGET_SYMBOL, exit_side)
+                        item["status"] = "emergency_close_attempted_protection_failed"
+                    except Exception as close_error:
+                        item["emergency_close_error"] = str(close_error)
+                        item["status"] = "CRITICAL_protection_and_close_failed"
+                results.append(item)
             except Exception as account_error:
-                account_result["status"] = "error"
-                account_result["error"] = str(account_error)
+                item["status"] = "account_error"
+                item["error"] = str(account_error)
+                results.append(item)
 
-            account_results.append(account_result)
-
-        # Record the signal only if at least one account successfully passed
-        # validation and had its requested leverage applied and verified.
-        if any_account_processed:
+        if any_completed:
             SEEN_SIGNALS[fingerprint] = time.time()
-
-        response = {
-            "status": "multi_account_signal_processed",
-            "signal": signal,
-            "accounts": account_results,
-            "execution_enabled": EXECUTION_ENABLED,
-            "message": "Accounts processed independently. No orders placed."
-        }
-
-        log_event({
-            "event": "multi_account_webhook_processed",
-            "signal": signal,
-            "result": response
-        })
-
-        return response
-
+        return {"status":"demo_execution_processed","signal":signal,"accounts":results,"execution_enabled":True,"mode":"BINANCE_FUTURES_DEMO_ONLY"}
     except Exception as e:
-        log_event({"event": "webhook_error", "error": str(e)})
-        return JSONResponse(status_code=400, content={
-            "status": "error", "detail": str(e),
-            "execution_enabled": EXECUTION_ENABLED
-        })
+        log_event({"event":"webhook_execution_error","error":str(e)})
+        return JSONResponse(status_code=400, content={"status":"error","detail":str(e)})
