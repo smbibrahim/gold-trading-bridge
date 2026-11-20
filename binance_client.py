@@ -64,6 +64,12 @@ class BinanceClient:
         except Exception as exc:
             raise RuntimeError(f"Account {self.account_number}: JSON parsing failed at {endpoint}: {exc}")
 
+    # EXPLICIT USER-TRIGGERED DEMO AGREEMENT SIGNING
+    def sign_tradfi_perps_agreement(self):
+        # Binance documents POST /fapi/v1/stock/contract for signing the
+        # TradFi-Perps agreement. This client remains locked to Demo base URL.
+        return self._signed_request("POST", "/fapi/v1/stock/contract")
+
     # READ-ONLY / DIAGNOSTIC
     def test_connection(self):
         result = self.get_account()
@@ -77,10 +83,16 @@ class BinanceClient:
     def get_account(self):
         return self._signed_request("GET", "/fapi/v2/account")
 
+    _EXCHANGE_INFO_CACHE = {"ts": 0.0, "data": None}
+
     def get_exchange_info(self):
+        cache = BinanceClient._EXCHANGE_INFO_CACHE
+        if cache["data"] is not None and time.time() - cache["ts"] < 3600:
+            return cache["data"]
         response = self.session.get(self.BASE_URL + "/fapi/v1/exchangeInfo", timeout=15)
         response.raise_for_status()
-        return response.json()
+        cache["data"], cache["ts"] = response.json(), time.time()
+        return cache["data"]
 
     def get_position_mode(self):
         return self._signed_request("GET", "/fapi/v1/positionSide/dual")
@@ -105,6 +117,19 @@ class BinanceClient:
         return response.json()
 
     # EXECUTION — DEMO ONLY (base URL is hard-locked above)
+    def set_margin_type(self, symbol, margin_type):
+        margin_type = str(margin_type).upper()
+        if margin_type not in ("ISOLATED", "CROSSED", "CROSS"):
+            raise ValueError("Unsupported margin type")
+        api_value = "CROSSED" if margin_type in ("CROSS", "CROSSED") else "ISOLATED"
+        try:
+            return self._signed_request("POST", "/fapi/v1/marginType", {"symbol": symbol, "marginType": api_value})
+        except BinanceAPIError as exc:
+            # Binance -4046: margin type already set to requested type.
+            if "-4046" in str(exc) or "No need to change margin type" in str(exc):
+                return {"status": "already_set", "marginType": api_value}
+            raise
+
     def set_leverage(self, symbol, leverage):
         return self._signed_request("POST", "/fapi/v1/leverage", {"symbol": symbol, "leverage": int(leverage)})
 
