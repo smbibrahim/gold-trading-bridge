@@ -125,3 +125,48 @@ class BinanceClient:
             "/fapi/v1/leverageBracket",
             params
         )
+
+    # CONFIGURATION: Set leverage
+    def set_leverage(self, symbol, leverage):
+        leverage = int(leverage)
+
+        if leverage < 1 or leverage > 125:
+            raise ValueError(
+                "Leverage must be between 1 and 125"
+            )
+
+        result = self._signed_request(
+            "POST",
+            "/fapi/v1/leverage",
+            {
+                "symbol": symbol,
+                "leverage": leverage
+            }
+        )
+
+        return result
+
+    # CONFIGURATION: Set and verify leverage
+    def apply_and_verify_leverage(self, symbol, leverage):
+        leverage = int(leverage)
+
+        result = self.set_leverage(
+            symbol,
+            leverage
+        )
+
+        applied_leverage = result.get("leverage")
+
+        if applied_leverage != leverage:
+            raise RuntimeError(
+                f"Leverage verification failed. "
+                f"Requested {leverage}x, "
+                f"returned {applied_leverage}x"
+            )
+
+        return {
+            "status": "verified",
+            "symbol": symbol,
+            "requested_leverage": leverage,
+            "applied_leverage": applied_leverage
+        }
