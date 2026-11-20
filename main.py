@@ -1,3 +1,4 @@
+import os
 import re
 from fastapi import FastAPI, Request
 from fastapi.responses import JSONResponse
@@ -95,13 +96,23 @@ def parse_signal(message):
     return signal, None
 
 
+def account_status(account_number):
+    api_key = os.getenv(f"BINANCE_API_KEY_{account_number}")
+    api_secret = os.getenv(f"BINANCE_API_SECRET_{account_number}")
+
+    if api_key and api_secret:
+        return "credentials_configured"
+
+    return "not_configured"
+
+
 @app.post("/webhook")
 async def webhook(request: Request):
     try:
         body = await request.body()
         message = body.decode("utf-8").strip()
 
-        print("Incoming signal:", message)
+        print("Incoming signal received")
 
         signal, error = parse_signal(message)
 
@@ -114,22 +125,19 @@ async def webhook(request: Request):
                 }
             )
 
-        accounts = [
-            "Account 1",
-            "Account 2"
-        ]
+        accounts = []
 
-        results = []
+        for account_number in [1, 2]:
+            status = account_status(account_number)
 
-        for account in accounts:
-            results.append({
-                "account": account,
-                "status": "validated",
+            accounts.append({
+                "account": f"Account {account_number}",
+                "status": status,
                 "execution": "disabled"
             })
 
             print(
-                f"{account}: signal validated; "
+                f"Account {account_number}: {status}; "
                 "execution disabled"
             )
 
@@ -137,7 +145,7 @@ async def webhook(request: Request):
             content={
                 "status": "signal_validated",
                 "signal": signal,
-                "accounts": results,
+                "accounts": accounts,
                 "execution_enabled": False
             }
         )
