@@ -7,7 +7,7 @@ import logging
 
 import requests
 
-from fastapi import FastAPI, Request
+from fastapi import FastAPI, Request, BackgroundTasks
 from fastapi.responses import JSONResponse
 
 from binance_client import BinanceClient
@@ -1164,15 +1164,77 @@ async def validate_only(request: Request):
 
 EXECUTION_ENABLED = os.getenv("EXECUTION_ENABLED", "false").lower() == "true"
 
+def process_demo_signal(signal, fingerprint):
+    """Run demo-only execution after the webhook has been acknowledged."""
+    results = []
+    any_completed = False
+    for account_number in (1, 2):
+        item = {"account": f"Account {account_number}", "status": "started"}
+        try:
+            validation = validate_signal(signal, account_number)
+            item["validation"] = validation
+            if not validation.get("ready"):
+                item["status"] = "rejected_by_validation"
+                results.append(item)
+                continue
+
+            client = BinanceClient(account_number)
+            lev = client.apply_and_verify_leverage(TARGET_SYMBOL, signal["leverage"])
+            item["leverage"] = lev
+
+            # Explicitly require One-Way mode for closePosition protection.
+            mode = client.get_position_mode()
+            if mode.get("dualSidePosition"):
+                item["status"] = "rejected_hedge_mode"
+                item["reason"] = "Switch this demo account to One-Way Mode before execution."
+                results.append(item)
+                continue
+
+            side = "BUY" if signal["side"] == "LONG" else "SELL"
+            exit_side = "SELL" if side == "BUY" else "BUY"
+            entry_order = client.place_market_order(TARGET_SYMBOL, side, signal["quantity"])
+            item["entry_order"] = entry_order
+
+            position = client.get_open_position(TARGET_SYMBOL)
+            if not position or abs(float(position.get("positionAmt", 0))) <= 0:
+                item["status"] = "entry_not_confirmed"
+                results.append(item)
+                continue
+
+            item["position"] = position
+            try:
+                sl_order = client.place_close_position_order(TARGET_SYMBOL, exit_side, "STOP_MARKET", signal["sl"])
+                tp_order = client.place_close_position_order(TARGET_SYMBOL, exit_side, "TAKE_PROFIT_MARKET", signal["tp"])
+                item["stop_loss_order"] = sl_order
+                item["take_profit_order"] = tp_order
+                item["status"] = "demo_trade_open_with_protection"
+                any_completed = True
+            except Exception as protection_error:
+                item["protection_error"] = str(protection_error)
+                try:
+                    item["emergency_close"] = client.close_position_market(TARGET_SYMBOL, exit_side)
+                    item["status"] = "emergency_close_attempted_protection_failed"
+                except Exception as close_error:
+                    item["emergency_close_error"] = str(close_error)
+                    item["status"] = "CRITICAL_protection_and_close_failed"
+            results.append(item)
+        except Exception as account_error:
+            item["status"] = "account_error"
+            item["error"] = str(account_error)
+            results.append(item)
+
+    log_event({"event": "background_demo_execution_finished", "fingerprint": fingerprint, "signal": signal, "accounts": results, "any_completed": any_completed})
+
+
 @app.post("/webhook")
-async def webhook(request: Request):
+async def webhook(request: Request, background_tasks: BackgroundTasks):
     if not EXECUTION_ENABLED:
-        return JSONResponse(status_code=503, content={"status":"execution_disabled","execution_enabled":False})
+        return JSONResponse(status_code=503, content={"status": "execution_disabled", "execution_enabled": False})
     try:
         body = await request.body()
         signal, error = parse_signal(body.decode("utf-8").strip())
         if error:
-            return JSONResponse(status_code=400, content={"status":"rejected","reason":error})
+            return JSONResponse(status_code=400, content={"status": "rejected", "reason": error})
 
         fingerprint = signal_fingerprint(signal)
         now = time.time()
@@ -1180,69 +1242,19 @@ async def webhook(request: Request):
             if now - timestamp > DUPLICATE_WINDOW_SECONDS:
                 SEEN_SIGNALS.pop(key, None)
         if fingerprint in SEEN_SIGNALS:
-            return JSONResponse(status_code=409, content={"status":"duplicate_rejected"})
+            return JSONResponse(status_code=409, content={"status": "duplicate_rejected"})
 
-        results = []
-        any_completed = False
-        for account_number in (1, 2):
-            item = {"account": f"Account {account_number}", "status":"started"}
-            try:
-                validation = validate_signal(signal, account_number)
-                item["validation"] = validation
-                if not validation.get("ready"):
-                    item["status"] = "rejected_by_validation"
-                    results.append(item)
-                    continue
-
-                client = BinanceClient(account_number)
-                lev = client.apply_and_verify_leverage(TARGET_SYMBOL, signal["leverage"])
-                item["leverage"] = lev
-
-                # Explicitly require One-Way mode for this closePosition order design.
-                mode = client.get_position_mode()
-                if mode.get("dualSidePosition"):
-                    item["status"] = "rejected_hedge_mode"
-                    item["reason"] = "Switch this demo account to One-Way Mode before execution."
-                    results.append(item)
-                    continue
-
-                side = "BUY" if signal["side"] == "LONG" else "SELL"
-                exit_side = "SELL" if side == "BUY" else "BUY"
-                entry_order = client.place_market_order(TARGET_SYMBOL, side, signal["quantity"])
-                item["entry_order"] = entry_order
-
-                # Confirm a non-zero position before attaching protection.
-                position = client.get_open_position(TARGET_SYMBOL)
-                if not position or abs(float(position.get("positionAmt", 0))) <= 0:
-                    item["status"] = "entry_not_confirmed"
-                    results.append(item)
-                    continue
-
-                item["position"] = position
-                try:
-                    sl_order = client.place_close_position_order(TARGET_SYMBOL, exit_side, "STOP_MARKET", signal["sl"])
-                    tp_order = client.place_close_position_order(TARGET_SYMBOL, exit_side, "TAKE_PROFIT_MARKET", signal["tp"])
-                    item["stop_loss_order"] = sl_order
-                    item["take_profit_order"] = tp_order
-                    item["status"] = "demo_trade_open_with_protection"
-                    any_completed = True
-                except Exception as protection_error:
-                    item["protection_error"] = str(protection_error)
-                    try:
-                        item["emergency_close"] = client.close_position_market(TARGET_SYMBOL, exit_side)
-                        item["status"] = "emergency_close_attempted_protection_failed"
-                    except Exception as close_error:
-                        item["emergency_close_error"] = str(close_error)
-                        item["status"] = "CRITICAL_protection_and_close_failed"
-                results.append(item)
-            except Exception as account_error:
-                item["status"] = "account_error"
-                item["error"] = str(account_error)
-                results.append(item)
-
-        if any_completed:
-            SEEN_SIGNALS[fingerprint] = time.time()
-        return {"status":"demo_execution_processed","signal":signal,"accounts":results,"execution_enabled":True,"mode":"BINANCE_FUTURES_DEMO_ONLY"}
+        # Reserve fingerprint immediately so concurrent/repeated webhook calls don't enqueue twice.
+        SEEN_SIGNALS[fingerprint] = now
+        background_tasks.add_task(process_demo_signal, signal, fingerprint)
+        return JSONResponse(status_code=202, content={
+            "status": "accepted_for_background_demo_processing",
+            "signal": signal,
+            "accounts": ["Account 1", "Account 2"],
+            "execution_enabled": True,
+            "mode": "BINANCE_FUTURES_DEMO_ONLY",
+            "message": "Signal accepted. Background processing started after acknowledgement."
+        })
     except Exception as e:
-        log_event({"event":"webhook_execution_error","error":str(e)})
-        return JSONResponse(status_code=400, content={"status":"error","detail":str(e)})
+        log_event({"event": "webhook_error", "error": str(e)})
+        return JSONResponse(status_code=400, content={"status": "error", "detail": str(e)})
