@@ -331,17 +331,56 @@ def execute_for_account(signal, account_number, pre=None):
 
 
 
-# LIFECYCLE MONITOR V2: read-only position/protection reconciliation + stale Algo cleanup
-LIFECYCLE_SNAPSHOT = {}
-LIFECYCLE_LOCK = threading.Lock()
-MONITOR_INTERVAL = max(5, int(os.getenv("LIFECYCLE_MONITOR_INTERVAL", "10")))
-MONITOR_STARTED = False
+
+# FINAL PATCH: lifecycle reconciliation and closure-event journaling
+# State is written to LIFECYCLE_STATE_FILE (default /tmp on Render).
+# /tmp is ephemeral on Render unless a persistent disk is mounted.
+LIFECYCLE_STATE_FILE = os.getenv("LIFECYCLE_STATE_FILE", "/tmp/gold_bridge_lifecycle_state.json")
+LIFECYCLE_EVENTS = []
+LIFECYCLE_EVENT_LIMIT = 500
+ACCOUNT_LAST_STATE = {}
+
+def persist_lifecycle_state():
+    try:
+        with LIFECYCLE_LOCK:
+            payload = {"last_check": LIFECYCLE_SNAPSHOT.get("last_check"),
+                       "accounts": LIFECYCLE_SNAPSHOT.get("accounts", []),
+                       "events": LIFECYCLE_EVENTS[-LIFECYCLE_EVENT_LIMIT:],
+                       "account_last_state": ACCOUNT_LAST_STATE}
+        tmp = LIFECYCLE_STATE_FILE + ".tmp"
+        with open(tmp, "w", encoding="utf-8") as f:
+            json.dump(payload, f, default=str)
+        os.replace(tmp, LIFECYCLE_STATE_FILE)
+    except Exception as exc:
+        log_event({"event": "lifecycle_state_persist_error", "error": str(exc)})
+
+def load_lifecycle_state():
+    try:
+        with open(LIFECYCLE_STATE_FILE, "r", encoding="utf-8") as f:
+            payload = json.load(f)
+        with LIFECYCLE_LOCK:
+            LIFECYCLE_SNAPSHOT["last_check"] = payload.get("last_check")
+            LIFECYCLE_SNAPSHOT["accounts"] = payload.get("accounts", [])
+            LIFECYCLE_EVENTS[:] = payload.get("events", [])[-LIFECYCLE_EVENT_LIMIT:]
+            ACCOUNT_LAST_STATE.update(payload.get("account_last_state", {}))
+    except FileNotFoundError:
+        pass
+    except Exception as exc:
+        log_event({"event": "lifecycle_state_load_error", "error": str(exc)})
+
+def record_lifecycle_event(event):
+    event["timestamp"] = time.time()
+    with LIFECYCLE_LOCK:
+        LIFECYCLE_EVENTS.append(event)
+        del LIFECYCLE_EVENTS[:-LIFECYCLE_EVENT_LIMIT]
+    log_event(event)
 
 def inspect_account_lifecycle(account_number):
     client = BinanceClient(account_number)
     position = client.get_open_position(TARGET_SYMBOL)
     algos = client.get_open_algo_orders(TARGET_SYMBOL)
     algos = algos if isinstance(algos, list) else []
+    account_label = f"Account {account_number}"
     if not position:
         stale = len(algos) > 0
         cleanup = None
@@ -352,9 +391,9 @@ def inspect_account_lifecycle(account_number):
                 algos = algos if isinstance(algos, list) else []
             except Exception as exc:
                 cleanup = {"error": str(exc)}
-        return {"account": f"Account {account_number}", "state": "FLAT", "position": None,
-                "open_algo_count": len(algos), "stale_algo_cleanup": cleanup,
-                "flat_with_stale_algos": bool(algos)}
+        return {"account": account_label, "account_number": account_number, "state": "FLAT",
+                "position": None, "open_algo_count": len(algos), "stale_algo_cleanup": cleanup,
+                "flat_with_stale_algos": bool(algos), "algo_orders": algos}
     amt = float(position.get("positionAmt", 0))
     direction = "LONG" if amt > 0 else "SHORT"
     close_side = "SELL" if direction == "LONG" else "BUY"
@@ -362,12 +401,52 @@ def inspect_account_lifecycle(account_number):
                 and str(a.get("orderType", a.get("type", ""))).upper() in ("STOP_MARKET", "TAKE_PROFIT_MARKET")]
     sl_present = any(str(a.get("orderType", a.get("type", ""))).upper() == "STOP_MARKET" for a in relevant)
     tp_present = any(str(a.get("orderType", a.get("type", ""))).upper() == "TAKE_PROFIT_MARKET" for a in relevant)
-    return {"account": f"Account {account_number}", "state": "OPEN", "direction": direction,
+    return {"account": account_label, "account_number": account_number, "state": "OPEN", "direction": direction,
             "position_amount": amt, "entry_price": position.get("entryPrice"),
             "sl_present": sl_present, "tp_present": tp_present,
             "protected": sl_present and tp_present, "open_algo_count": len(algos),
             "position": position, "algo_orders": relevant,
             "warning": None if sl_present and tp_present else "OPEN_POSITION_MISSING_PROTECTION"}
+
+def reconcile_lifecycle(snapshots):
+    now = time.time()
+    for snap in snapshots:
+        n = snap.get("account_number")
+        if not n:
+            match = re.search(r"(\\d+)$", str(snap.get("account", "")))
+            n = int(match.group(1)) if match else None
+        if n is None:
+            continue
+        previous = ACCOUNT_LAST_STATE.get(str(n))
+        current = snap.get("state")
+        if previous is None:
+            record_lifecycle_event({"event": "LIFECYCLE_BASELINE", "account": snap.get("account"),
+                                   "state": current, "timestamp": now,
+                                   "note": "First observed state; no prior state available for transition attribution"})
+        elif previous.get("state") == "OPEN" and current == "FLAT":
+            record_lifecycle_event({"event": "POSITION_CLOSED_DETECTED", "account": snap.get("account"),
+                                   "previous_direction": previous.get("direction"),
+                                   "previous_position_amount": previous.get("position_amount"),
+                                   "previous_entry_price": previous.get("entry_price"),
+                                   "previous_protection": previous.get("algo_orders", []),
+                                   "closure_reason": "EXCHANGE_POSITION_FLAT; trigger attribution not confirmed",
+                                   "timestamp": now})
+        elif previous.get("state") == "FLAT" and current == "OPEN":
+            record_lifecycle_event({"event": "POSITION_OPEN_DETECTED", "account": snap.get("account"),
+                                   "direction": snap.get("direction"), "position_amount": snap.get("position_amount"),
+                                   "entry_price": snap.get("entry_price"), "timestamp": now})
+        elif previous.get("state") == "OPEN" and current == "OPEN":
+            changed = (previous.get("direction") != snap.get("direction") or
+                       abs(float(previous.get("position_amount", 0)) - float(snap.get("position_amount", 0))) > 1e-8)
+            if changed:
+                record_lifecycle_event({"event": "POSITION_CHANGED_DETECTED", "account": snap.get("account"),
+                                       "previous": previous, "current": snap, "timestamp": now})
+        if snap.get("warning") or snap.get("flat_with_stale_algos") or current == "MONITOR_ERROR":
+            record_lifecycle_event({"event": "LIFECYCLE_WARNING", "snapshot": snap, "timestamp": now})
+        ACCOUNT_LAST_STATE[str(n)] = {"state": current, "direction": snap.get("direction"),
+                                     "position_amount": snap.get("position_amount"),
+                                     "entry_price": snap.get("entry_price"),
+                                     "algo_orders": snap.get("algo_orders", []), "observed_at": now}
 
 def lifecycle_monitor_loop():
     while True:
@@ -378,204 +457,44 @@ def lifecycle_monitor_loop():
                 try:
                     snapshots.append(inspect_account_lifecycle(n))
                 except Exception as exc:
-                    snapshots.append({"account": f"Account {n}", "state": "MONITOR_ERROR", "error": str(exc)})
+                    snapshots.append({"account": f"Account {n}", "account_number": n,
+                                     "state": "MONITOR_ERROR", "error": str(exc)})
             with LIFECYCLE_LOCK:
                 LIFECYCLE_SNAPSHOT["last_check"] = time.time()
                 LIFECYCLE_SNAPSHOT["accounts"] = snapshots
+            reconcile_lifecycle(snapshots)
             open_states = [x for x in snapshots if x.get("state") == "OPEN"]
             if len(open_states) > 1:
                 dirs = {x.get("direction") for x in open_states}
                 sizes = [abs(float(x.get("position_amount", 0))) for x in open_states]
                 if len(dirs) > 1 or (sizes and max(sizes)-min(sizes) > 1e-8):
-                    log_event({"event": "ACCOUNT_POSITION_DIVERGENCE", "accounts": snapshots})
-            for x in snapshots:
-                if x.get("warning") or x.get("flat_with_stale_algos") or x.get("state") == "MONITOR_ERROR":
-                    log_event({"event": "LIFECYCLE_WARNING", "snapshot": x})
-            log_event({"event": "lifecycle_snapshot", "accounts": snapshots})
+                    record_lifecycle_event({"event": "ACCOUNT_POSITION_DIVERGENCE", "accounts": snapshots})
+            with LIFECYCLE_LOCK:
+                LIFECYCLE_SNAPSHOT["events_count"] = len(LIFECYCLE_EVENTS)
+            persist_lifecycle_state()
         except Exception as exc:
             log_event({"event": "lifecycle_monitor_loop_error", "error": str(exc)})
         time.sleep(MONITOR_INTERVAL)
 
-@app.get("/lifecycle-status")
-def lifecycle_status(request: Request):
-    if not token_ok(request): return JSONResponse(status_code=401, content={"status": "unauthorized"})
-    with LIFECYCLE_LOCK:
-        return {"mode": "BINANCE_DEMO", "monitor_interval_seconds": MONITOR_INTERVAL, **LIFECYCLE_SNAPSHOT}
-
-
-@app.get("/")
-def home():
-    return {"service": "Gold Trading Bridge", "status": "running", "mode": "BINANCE_DEMO", "execution_enabled": EXECUTION_ENABLED, "target": TARGET_SYMBOL}
-
-@app.get("/health")
-def health():
-    return {"status": "healthy", "execution_enabled": EXECUTION_ENABLED, "mode": "BINANCE_DEMO"}
-
-@app.get("/diagnostic")
-def diagnostic():
-    results = {}
-    for name, endpoint in (("ping", "/fapi/v1/ping"), ("time", "/fapi/v1/time")):
-        try:
-            r = requests.get(BINANCE_BASE_URL + endpoint, timeout=10); results[name] = {"http_status": r.status_code, "success": r.status_code == 200, "response": r.text[:500]}
-        except Exception as exc: results[name] = {"success": False, "error": str(exc)}
-    return {"results": results, "execution_enabled": EXECUTION_ENABLED}
-
-@app.get("/test-connections")
-def test_connections(request: Request):
-    if not token_ok(request): return JSONResponse(status_code=401, content={"status":"unauthorized"})
-    results=[]
-    for n in (active_accounts() or (1,2)):
-        try: results.append(BinanceClient(n).test_connection())
-        except Exception as exc: results.append({"account":f"Account {n}","status":"error","error":str(exc)})
-    return {"results":results,"execution_enabled":EXECUTION_ENABLED}
-
-@app.get("/account-config")
-def account_config(request: Request):
-    if not token_ok(request): return JSONResponse(status_code=401, content={"status":"unauthorized"})
-    results=[]
-    for n in (active_accounts() or (1,2)):
-        try:
-            c=BinanceClient(n); results.append({"account":f"Account {n}","position_mode":c.get_position_mode(),"positions":c.get_position_risk(TARGET_SYMBOL),"brackets":c.get_leverage_brackets(TARGET_SYMBOL)})
-        except Exception as exc: results.append({"account":f"Account {n}","error":str(exc)})
-    return {"results":results,"execution_enabled":EXECUTION_ENABLED}
-
-@app.get("/validate-contract")
-def validate_contract(symbol: str = TARGET_SYMBOL, quantity: float = 1, price: float = 3500):
-    try:
-        c=BinanceClient(1); data=symbol_info(c,symbol.upper())
-        if not data: return {"status":"rejected","reason":"Symbol not found","execution_enabled":EXECUTION_ENABLED}
-        f=filters_for(data); lot,mlot,pf=f.get("LOT_SIZE",{}),f.get("MARKET_LOT_SIZE",{}),f.get("PRICE_FILTER",{}); nf=f.get("MIN_NOTIONAL",f.get("NOTIONAL",{})); mn=float(nf.get("notional",nf.get("minNotional",0)))
-        checks={"trading":data.get("status")=="TRADING","lot":float(lot.get("minQty",0))<=quantity<=float(lot.get("maxQty",0)) and check_step(quantity,float(lot.get("stepSize",0))),"market_lot":float(mlot.get("minQty",0))<=quantity<=float(mlot.get("maxQty",0)) and check_step(quantity,float(mlot.get("stepSize",0))),"price":check_step(price,float(pf.get("tickSize",0))),"notional":quantity*price>=mn}
-        return {"status":"validated" if all(checks.values()) else "rejected","symbol":symbol,"quantity":quantity,"price":price,"checks":checks,"execution_enabled":EXECUTION_ENABLED}
-    except Exception as exc: return {"status":"error","error":str(exc),"execution_enabled":EXECUTION_ENABLED}
-
-@app.post("/sign-tradfi-agreement")
-def sign_tradfi_agreement(request: Request):
-    """Explicitly sign Binance TradFi Perps agreement on configured Demo accounts."""
+@app.get("/lifecycle-events")
+def lifecycle_events(request: Request, limit: int = 100):
     if not token_ok(request):
         return JSONResponse(status_code=401, content={"status": "unauthorized"})
-    if not EXECUTION_ENABLED:
-        return JSONResponse(status_code=503, content={"status": "execution_disabled", "mode": "BINANCE_DEMO"})
-    accounts = active_accounts()
-    if not accounts:
-        return JSONResponse(status_code=400, content={"status": "no_configured_accounts"})
-    results = []
-    for n in accounts:
-        try:
-            c = BinanceClient(n)
-            result = c.sign_tradfi_perps_agreement()
-            results.append({"account": f"Account {n}", "status": "success", "response": result})
-        except Exception as exc:
-            results.append({"account": f"Account {n}", "status": "failed", "error": str(exc)})
-    overall = "success" if all(r["status"] == "success" for r in results) else "partial_or_failed"
-    log_event({"event": "tradfi_agreement_sign_attempt", "results": results})
-    return {"status": overall, "mode": "BINANCE_DEMO", "accounts": results}
+    limit = max(1, min(int(limit), LIFECYCLE_EVENT_LIMIT))
+    with LIFECYCLE_LOCK:
+        return {"mode": "BINANCE_DEMO", "events": LIFECYCLE_EVENTS[-limit:], "total": len(LIFECYCLE_EVENTS)}
 
+@app.get("/reconciliation")
+def reconciliation(request: Request):
+    if not token_ok(request):
+        return JSONResponse(status_code=401, content={"status": "unauthorized"})
+    with LIFECYCLE_LOCK:
+        return {"mode": "BINANCE_DEMO", "last_check": LIFECYCLE_SNAPSHOT.get("last_check"),
+                "accounts": LIFECYCLE_SNAPSHOT.get("accounts", []),
+                "events_count": len(LIFECYCLE_EVENTS),
+                "note": "Exchange position state is authoritative. Closure trigger attribution is not guaranteed by this monitor."}
 
-@app.post("/validate-signal")
-async def validate_only(request: Request):
-    if not token_ok(request): return JSONResponse(status_code=401, content={"status":"unauthorized"})
-    try:
-        signal,error=parse_signal((await request.body()).decode())
-        if error: return JSONResponse(status_code=400,content={"status":"rejected","reason":error,"execution_enabled":EXECUTION_ENABLED})
-        results=[validate_signal(signal,n) for n in (active_accounts() or (1,2))]
-        return {"status":"multi_account_validation","signal":signal,"accounts":results,"execution_enabled":EXECUTION_ENABLED}
-    except Exception as exc: return JSONResponse(status_code=400,content={"status":"error","detail":str(exc),"execution_enabled":EXECUTION_ENABLED})
-
-def run_forced_close(close_side):
-    results = []
-    with EXECUTION_LOCK:
-        for n in active_accounts():
-            try:
-                c = BinanceClient(n)
-                pos = c.get_open_position(TARGET_SYMBOL)
-                if not pos:
-                    results.append({"account": f"Account {n}", "status": "already_flat"}); continue
-                amt = float(pos.get("positionAmt", 0))
-                current_side = "LONG" if amt > 0 else "SHORT" if amt < 0 else None
-                if current_side != close_side:
-                    results.append({"account": f"Account {n}", "status": "direction_mismatch"}); continue
-                c.cancel_all_open_algo_orders(TARGET_SYMBOL)
-                close_result = c.close_position_market(TARGET_SYMBOL)
-                results.append({"account": f"Account {n}", "status": "closed" if close_result.get("confirmed_flat") else "close_unconfirmed", "result": close_result})
-            except Exception as exc:
-                results.append({"account": f"Account {n}", "status": "error", "error": str(exc)})
-    log_event({"event": "forced_close_result", "requested_side": close_side, "accounts": results})
-
-
-def run_entry(signal, fp):
-    set_status(fp, "EXECUTING")
-    results = []
-    try:
-        with EXECUTION_LOCK:
-            accounts = active_accounts()
-            if not accounts:
-                set_status(fp, "FAILED", {"reason": "No account credentials configured"})
-                release_signal(fp)
-                log_event({"event": "rejected_no_accounts", "fingerprint": fp})
-                return
-            preflight = [validate_signal(signal, n) for n in accounts]
-            results = []
-            for n, pre in zip(accounts, preflight):
-                if pre.get("ready"):
-                    results.append(execute_for_account(signal, n, pre))
-                else:
-                    results.append({"account": f"Account {n}", "status": "REJECTED_PREFLIGHT", "validation": pre})
-            statuses = [x.get("status") for x in results]
-            if all(x == "EXECUTED_AND_PROTECTED" for x in statuses):
-                final_status = "EXECUTED"
-            elif any(x == "EXECUTED_AND_PROTECTED" for x in statuses):
-                final_status = "PARTIAL"
-            else:
-                final_status = "FAILED"
-            set_status(fp, final_status, results)
-            log_event({"event": "execution_result", "fingerprint": fp, "signal": signal, "results": results})
-    except Exception as exc:
-        set_status(fp, "FAILED", {"error": str(exc), "account_results": results})
-        log_event({"event": "run_entry_error", "fingerprint": fp, "error": str(exc), "results": results})
-
-
-@app.get("/signal-status/{fingerprint}")
-def signal_status(fingerprint: str, request: Request):
-    if not token_ok(request): return JSONResponse(status_code=401, content={"status":"unauthorized"})
-    record = get_status(fingerprint)
-    if record is None: return JSONResponse(status_code=404, content={"status":"not_found"})
-    return {"fingerprint": fingerprint, **record}
-
-
-@app.post("/webhook")
-async def webhook(request: Request, background: BackgroundTasks):
-    try:
-        raw = (await request.body()).decode("utf-8", errors="replace").strip()
-        try: payload = json.loads(raw)
-        except json.JSONDecodeError: payload = None
-        if isinstance(payload, dict) and str(payload.get("type", "")).upper() == "KEEPALIVE":
-            log_event({"event": "keepalive_received", "source": payload.get("source", "unknown")})
-            return {"status": "keepalive_received", "trading": False, "binance_contacted": False}
-        if not token_ok(request):
-            log_event({"event": "webhook_unauthorized"})
-            return JSONResponse(status_code=401, content={"status": "unauthorized"})
-        if raw.lower() in ("/close_long", "/close_short"):
-            if not EXECUTION_ENABLED:
-                return JSONResponse(status_code=503, content={"status": "execution_disabled", "mode": "BINANCE_DEMO", "execution_enabled": False})
-            close_side = "LONG" if raw.lower() == "/close_long" else "SHORT"
-            background.add_task(run_forced_close, close_side)
-            return {"status": "close_accepted", "requested_side": close_side, "demo_only": True}
-        signal, error = parse_signal(raw)
-        if error:
-            log_event({"event": "signal_rejected", "reason": error, "raw": raw[:500]})
-            return JSONResponse(status_code=400, content={"status": "rejected", "reason": error, "execution_enabled": EXECUTION_ENABLED})
-        if not EXECUTION_ENABLED:
-            return JSONResponse(status_code=503, content={"status": "execution_disabled", "mode": "BINANCE_DEMO", "execution_enabled": False})
-        accepted, fp = reserve_signal(signal)
-        if not accepted:
-            return JSONResponse(status_code=409, content={"status": "duplicate_rejected", "execution_enabled": True})
-        set_status(fp, "ACCEPTED")
-        background.add_task(run_entry, signal, fp)
-        return {"status": "accepted", "fingerprint": fp, "accounts": active_accounts(), "demo_only": True, "execution_note": "Accepted by bridge; execution outcome is asynchronous. Check signal-status endpoint or Render logs."}
-    except Exception as exc:
-        log_event({"event": "webhook_error", "error": str(exc)})
-        return JSONResponse(status_code=400, content={"status": "error", "detail": str(exc), "execution_enabled": EXECUTION_ENABLED})
+load_lifecycle_state()
 
 # Start the lifecycle monitor in a daemon thread (one monitor per service process).
 if not MONITOR_STARTED:
