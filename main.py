@@ -311,6 +311,80 @@ def execute_for_account(signal, account_number, pre=None):
         return outcome
 
 
+
+
+# LIFECYCLE MONITOR V2: read-only position/protection reconciliation + stale Algo cleanup
+LIFECYCLE_SNAPSHOT = {}
+LIFECYCLE_LOCK = threading.Lock()
+MONITOR_INTERVAL = max(5, int(os.getenv("LIFECYCLE_MONITOR_INTERVAL", "10")))
+MONITOR_STARTED = False
+
+def inspect_account_lifecycle(account_number):
+    client = BinanceClient(account_number)
+    position = client.get_open_position(TARGET_SYMBOL)
+    algos = client.get_open_algo_orders(TARGET_SYMBOL)
+    algos = algos if isinstance(algos, list) else []
+    if not position:
+        stale = len(algos) > 0
+        cleanup = None
+        if stale:
+            try:
+                cleanup = client.cancel_all_open_algo_orders(TARGET_SYMBOL)
+                algos = client.get_open_algo_orders(TARGET_SYMBOL)
+                algos = algos if isinstance(algos, list) else []
+            except Exception as exc:
+                cleanup = {"error": str(exc)}
+        return {"account": f"Account {account_number}", "state": "FLAT", "position": None,
+                "open_algo_count": len(algos), "stale_algo_cleanup": cleanup,
+                "flat_with_stale_algos": bool(algos)}
+    amt = float(position.get("positionAmt", 0))
+    direction = "LONG" if amt > 0 else "SHORT"
+    close_side = "SELL" if direction == "LONG" else "BUY"
+    relevant = [a for a in algos if str(a.get("side", "")).upper() == close_side
+                and str(a.get("type", "")).upper() in ("STOP_MARKET", "TAKE_PROFIT_MARKET")]
+    sl_present = any(str(a.get("type", "")).upper() == "STOP_MARKET" for a in relevant)
+    tp_present = any(str(a.get("type", "")).upper() == "TAKE_PROFIT_MARKET" for a in relevant)
+    return {"account": f"Account {account_number}", "state": "OPEN", "direction": direction,
+            "position_amount": amt, "entry_price": position.get("entryPrice"),
+            "sl_present": sl_present, "tp_present": tp_present,
+            "protected": sl_present and tp_present, "open_algo_count": len(algos),
+            "position": position, "algo_orders": relevant,
+            "warning": None if sl_present and tp_present else "OPEN_POSITION_MISSING_PROTECTION"}
+
+def lifecycle_monitor_loop():
+    while True:
+        try:
+            accounts = active_accounts()
+            snapshots = []
+            for n in accounts:
+                try:
+                    snapshots.append(inspect_account_lifecycle(n))
+                except Exception as exc:
+                    snapshots.append({"account": f"Account {n}", "state": "MONITOR_ERROR", "error": str(exc)})
+            with LIFECYCLE_LOCK:
+                LIFECYCLE_SNAPSHOT["last_check"] = time.time()
+                LIFECYCLE_SNAPSHOT["accounts"] = snapshots
+            open_states = [x for x in snapshots if x.get("state") == "OPEN"]
+            if len(open_states) > 1:
+                dirs = {x.get("direction") for x in open_states}
+                sizes = [abs(float(x.get("position_amount", 0))) for x in open_states]
+                if len(dirs) > 1 or (sizes and max(sizes)-min(sizes) > 1e-8):
+                    log_event({"event": "ACCOUNT_POSITION_DIVERGENCE", "accounts": snapshots})
+            for x in snapshots:
+                if x.get("warning") or x.get("flat_with_stale_algos") or x.get("state") == "MONITOR_ERROR":
+                    log_event({"event": "LIFECYCLE_WARNING", "snapshot": x})
+            log_event({"event": "lifecycle_snapshot", "accounts": snapshots})
+        except Exception as exc:
+            log_event({"event": "lifecycle_monitor_loop_error", "error": str(exc)})
+        time.sleep(MONITOR_INTERVAL)
+
+@app.get("/lifecycle-status")
+def lifecycle_status(request: Request):
+    if not token_ok(request): return JSONResponse(status_code=401, content={"status": "unauthorized"})
+    with LIFECYCLE_LOCK:
+        return {"mode": "BINANCE_DEMO", "monitor_interval_seconds": MONITOR_INTERVAL, **LIFECYCLE_SNAPSHOT}
+
+
 @app.get("/")
 def home():
     return {"service": "Gold Trading Bridge", "status": "running", "mode": "BINANCE_DEMO", "execution_enabled": EXECUTION_ENABLED, "target": TARGET_SYMBOL}
@@ -484,3 +558,8 @@ async def webhook(request: Request, background: BackgroundTasks):
     except Exception as exc:
         log_event({"event": "webhook_error", "error": str(exc)})
         return JSONResponse(status_code=400, content={"status": "error", "detail": str(exc), "execution_enabled": EXECUTION_ENABLED})
+
+# Start the lifecycle monitor in a daemon thread (one monitor per service process).
+if not MONITOR_STARTED:
+    MONITOR_STARTED = True
+    threading.Thread(target=lifecycle_monitor_loop, daemon=True, name="lifecycle-monitor").start()
