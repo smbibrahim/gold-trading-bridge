@@ -158,6 +158,13 @@ class BinanceClient:
         amount = float(position.get("positionAmt", 0))
         side, quantity = ("SELL" if amount > 0 else "BUY"), abs(amount)
         result = self._signed_request("POST", "/fapi/v1/order", {"symbol": symbol, "side": side, "type": "MARKET", "quantity": str(quantity), "reduceOnly": "true", "newOrderRespType": "RESULT"})
-        time.sleep(0.5)
-        confirm = self.get_open_position(symbol)
-        return {"close_order": result, "confirmed_flat": confirm is None, "remaining_position": confirm}
+        confirmation = None
+        attempts = 5
+        for attempt in range(attempts):
+            time.sleep(0.5)
+            confirmation = self.get_open_position(symbol)
+            if confirmation is None:
+                return {"close_order": result, "confirmed_flat": True, "remaining_position": None,
+                        "confirmation_attempts": attempt + 1}
+        return {"close_order": result, "confirmed_flat": False, "remaining_position": confirmation,
+                "confirmation_attempts": attempts}
