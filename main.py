@@ -221,12 +221,34 @@ def confirm_position(client, symbol, attempts=5, delay=0.5):
     return None
 
 
-def verify_algo_orders(client, symbol, algo_ids):
-    verified = []
-    for aid in algo_ids:
-        details = client.query_algo_order(symbol, aid)
-        verified.append(details)
-    return verified
+def verify_algo_orders(client, symbol, expected_orders, attempts=4, delay=1.0):
+    """Verify protective orders from the open Algo-order listing, not fragile per-ID queries.
+    Binance Algo responses use orderType (not type) and may vary in field naming.
+    """
+    expected = {str(o.get("algoId")): o for o in expected_orders if o.get("algoId") is not None}
+    last_orders = []
+    for attempt in range(attempts):
+        listing = client.get_open_algo_orders(symbol)
+        if not isinstance(listing, list):
+            raise RuntimeError(f"Unexpected open Algo-order response type: {type(listing).__name__}")
+        last_orders = listing
+        matched = []
+        for aid, submitted in expected.items():
+            match = next((a for a in listing if str(a.get("algoId")) == aid), None)
+            if not match:
+                continue
+            order_type = str(match.get("orderType", match.get("type", ""))).upper()
+            valid = (match.get("symbol") == symbol
+                     and order_type == str(submitted.get("orderType", submitted.get("type", ""))).upper()
+                     and str(match.get("side", "")).upper() == str(submitted.get("side", "")).upper()
+                     and str(match.get("closePosition", "")).lower() in ("true", "1")
+                     and str(match.get("algoStatus", "NEW")).upper() in ("NEW", "WORKING", "ACTIVE"))
+            matched.append({"algoId": aid, "matched": bool(valid), "details": match})
+        if len(matched) == len(expected) and all(x["matched"] for x in matched):
+            return {"verified": True, "attempt": attempt + 1, "orders": matched, "open_orders": listing}
+        if attempt < attempts - 1:
+            time.sleep(delay)
+    return {"verified": False, "attempts": attempts, "orders": matched if expected else [], "open_orders": last_orders}
 
 
 def execute_for_account(signal, account_number, pre=None):
@@ -276,15 +298,11 @@ def execute_for_account(signal, account_number, pre=None):
         outcome["sl_algo"] = sl_order
         tp_order = client.place_close_all_algo(TARGET_SYMBOL, closing_side, "TAKE_PROFIT_MARKET", signal["tp"])
         outcome["tp_algo"] = tp_order
-        ids = [sl_order.get("algoId"), tp_order.get("algoId")]
-        if any(x is None for x in ids):
+        if sl_order.get("algoId") is None or tp_order.get("algoId") is None:
             raise RuntimeError("Protective orders did not return both algo IDs")
-        outcome["protective_order_verification"] = verify_algo_orders(client, TARGET_SYMBOL, ids)
-        # Verify both orders appear in open algo orders and symbol/closePosition attributes.
-        opened = client.get_open_algo_orders(TARGET_SYMBOL)
-        open_ids = {str(x.get("algoId")) for x in opened} if isinstance(opened, list) else set()
-        if not all(str(x) in open_ids for x in ids):
-            raise RuntimeError("Protective orders not both present in open Algo orders")
+        outcome["protective_order_verification"] = verify_algo_orders(client, TARGET_SYMBOL, [sl_order, tp_order])
+        if not outcome["protective_order_verification"].get("verified"):
+            raise RuntimeError("Protective orders were not confirmed in repeated open Algo-order listings")
         outcome["status"] = "EXECUTED_AND_PROTECTED"
         outcome["position_size"] = amount
         outcome["average_entry"] = fill_price
@@ -341,9 +359,9 @@ def inspect_account_lifecycle(account_number):
     direction = "LONG" if amt > 0 else "SHORT"
     close_side = "SELL" if direction == "LONG" else "BUY"
     relevant = [a for a in algos if str(a.get("side", "")).upper() == close_side
-                and str(a.get("type", "")).upper() in ("STOP_MARKET", "TAKE_PROFIT_MARKET")]
-    sl_present = any(str(a.get("type", "")).upper() == "STOP_MARKET" for a in relevant)
-    tp_present = any(str(a.get("type", "")).upper() == "TAKE_PROFIT_MARKET" for a in relevant)
+                and str(a.get("orderType", a.get("type", ""))).upper() in ("STOP_MARKET", "TAKE_PROFIT_MARKET")]
+    sl_present = any(str(a.get("orderType", a.get("type", ""))).upper() == "STOP_MARKET" for a in relevant)
+    tp_present = any(str(a.get("orderType", a.get("type", ""))).upper() == "TAKE_PROFIT_MARKET" for a in relevant)
     return {"account": f"Account {account_number}", "state": "OPEN", "direction": direction,
             "position_amount": amt, "entry_price": position.get("entryPrice"),
             "sl_present": sl_present, "tp_present": tp_present,
@@ -497,12 +515,12 @@ def run_entry(signal, fp):
                 log_event({"event": "rejected_no_accounts", "fingerprint": fp})
                 return
             preflight = [validate_signal(signal, n) for n in accounts]
-            if not all(x.get("ready") for x in preflight):
-                set_status(fp, "FAILED_PREFLIGHT", preflight)
-                release_signal(fp)
-                log_event({"event": "rejected_preflight", "fingerprint": fp, "accounts": preflight})
-                return
-            results = [execute_for_account(signal, n, pre) for n, pre in zip(accounts, preflight)]
+            results = []
+            for n, pre in zip(accounts, preflight):
+                if pre.get("ready"):
+                    results.append(execute_for_account(signal, n, pre))
+                else:
+                    results.append({"account": f"Account {n}", "status": "REJECTED_PREFLIGHT", "validation": pre})
             statuses = [x.get("status") for x in results]
             if all(x == "EXECUTED_AND_PROTECTED" for x in statuses):
                 final_status = "EXECUTED"
