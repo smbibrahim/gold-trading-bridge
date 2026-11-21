@@ -16,10 +16,7 @@ class BinanceAPIError(RuntimeError):
         self.request_params = request_params
         message = payload.get("msg") if isinstance(payload, dict) else str(payload)
         code = payload.get("code") if isinstance(payload, dict) else None
-        super().__init__(
-            f"Binance Account {account_number} API error | HTTP {status_code} | "
-            f"code={code} | message={message} | endpoint={endpoint} | params={request_params}"
-        )
+        super().__init__(f"Binance Account {account_number} API error | HTTP {status_code} | code={code} | message={message} | endpoint={endpoint} | params={request_params}")
 
 
 class BinanceClient:
@@ -43,56 +40,30 @@ class BinanceClient:
         params["timestamp"] = int(time.time() * 1000)
         params.setdefault("recvWindow", 5000)
         query = urlencode(params)
-        params["signature"] = hmac.new(
-            self.api_secret.encode("utf-8"), query.encode("utf-8"), hashlib.sha256
-        ).hexdigest()
+        params["signature"] = hmac.new(self.api_secret.encode(), query.encode(), hashlib.sha256).hexdigest()
         method = method.upper()
         url = self.BASE_URL + endpoint
-        if method in ("GET", "DELETE"):
-            response = self.session.request(method, url, params=params, timeout=15)
-        else:
-            response = self.session.request(method, url, data=params, timeout=15)
-
-        # Diagnostic-friendly handling: preserve HTTP status, content type and raw body
-        # when Binance (or a proxy) returns non-JSON, including an empty response.
+        response = self.session.request(method, url, params=params if method in ("GET", "DELETE") else None,
+                                       data=params if method not in ("GET", "DELETE") else None, timeout=15)
         try:
             payload = response.json()
         except Exception:
             payload = None
         if not response.ok:
             if not isinstance(payload, dict):
-                payload = {
-                    "raw_response": response.text[:2000],
-                    "content_type": response.headers.get("Content-Type"),
-                    "response_empty": not bool(response.text),
-                }
+                payload = {"raw_response": response.text[:2000], "content_type": response.headers.get("Content-Type"), "response_empty": not bool(response.text)}
             raise BinanceAPIError(self.account_number, method, endpoint, response.status_code, payload, safe_params)
         if payload is not None:
             return payload
-        return {
-            "diagnostic": "non_json_response",
-            "http_status": response.status_code,
-            "endpoint": endpoint,
-            "content_type": response.headers.get("Content-Type"),
-            "raw_response": response.text[:2000],
-            "response_empty": not bool(response.text),
-        }
+        return {"diagnostic": "non_json_response", "http_status": response.status_code, "endpoint": endpoint,
+                "content_type": response.headers.get("Content-Type"), "raw_response": response.text[:2000], "response_empty": not bool(response.text)}
 
-    # EXPLICIT USER-TRIGGERED DEMO AGREEMENT SIGNING
     def sign_tradfi_perps_agreement(self):
-        # Binance documents POST /fapi/v1/stock/contract for signing the
-        # TradFi-Perps agreement. This client remains locked to Demo base URL.
         return self._signed_request("POST", "/fapi/v1/stock/contract")
 
-    # READ-ONLY / DIAGNOSTIC
     def test_connection(self):
         result = self.get_account()
-        return {
-            "status": "connected",
-            "account": f"Account {self.account_number}",
-            "can_trade": result.get("canTrade"),
-            "available_balance": result.get("availableBalance"),
-        }
+        return {"status": "connected", "account": f"Account {self.account_number}", "can_trade": result.get("canTrade"), "available_balance": result.get("availableBalance")}
 
     def get_account(self):
         return self._signed_request("GET", "/fapi/v2/account")
@@ -130,7 +101,6 @@ class BinanceClient:
         response.raise_for_status()
         return response.json()
 
-    # EXECUTION — DEMO ONLY (base URL is hard-locked above)
     def set_margin_type(self, symbol, margin_type):
         margin_type = str(margin_type).upper()
         if margin_type not in ("ISOLATED", "CROSSED", "CROSS"):
@@ -139,7 +109,6 @@ class BinanceClient:
         try:
             return self._signed_request("POST", "/fapi/v1/marginType", {"symbol": symbol, "marginType": api_value})
         except BinanceAPIError as exc:
-            # Binance -4046: margin type already set to requested type.
             if "-4046" in str(exc) or "No need to change margin type" in str(exc):
                 return {"status": "already_set", "marginType": api_value}
             raise
@@ -148,13 +117,7 @@ class BinanceClient:
         return self._signed_request("POST", "/fapi/v1/leverage", {"symbol": symbol, "leverage": int(leverage)})
 
     def market_entry(self, symbol, side, quantity, client_order_id=None):
-        params = {
-            "symbol": symbol,
-            "side": side.upper(),
-            "type": "MARKET",
-            "quantity": str(quantity),
-            "newOrderRespType": "RESULT",
-        }
+        params = {"symbol": symbol, "side": side.upper(), "type": "MARKET", "quantity": str(quantity), "newOrderRespType": "RESULT"}
         if client_order_id:
             params["newClientOrderId"] = str(client_order_id)[:36]
         return self._signed_request("POST", "/fapi/v1/order", params)
@@ -172,16 +135,9 @@ class BinanceClient:
     def place_close_all_algo(self, symbol, closing_side, order_type, trigger_price, working_type="CONTRACT_PRICE"):
         if order_type not in ("STOP_MARKET", "TAKE_PROFIT_MARKET"):
             raise ValueError("Only STOP_MARKET and TAKE_PROFIT_MARKET are supported")
-        return self._signed_request("POST", "/fapi/v1/algoOrder", {
-            "algoType": "CONDITIONAL",
-            "symbol": symbol,
-            "side": closing_side.upper(),
-            "type": order_type,
-            "triggerPrice": str(trigger_price),
-            "closePosition": "true",
-            "workingType": working_type,
-            "priceProtect": "false",
-        })
+        return self._signed_request("POST", "/fapi/v1/algoOrder", {"algoType": "CONDITIONAL", "symbol": symbol,
+            "side": closing_side.upper(), "type": order_type, "triggerPrice": str(trigger_price), "closePosition": "true",
+            "workingType": working_type, "priceProtect": "false"})
 
     def get_open_algo_orders(self, symbol):
         return self._signed_request("GET", "/fapi/v1/openAlgoOrders", {"symbol": symbol})
@@ -200,21 +156,8 @@ class BinanceClient:
         if not position:
             return {"status": "already_flat", "confirmed_flat": True}
         amount = float(position.get("positionAmt", 0))
-        side = "SELL" if amount > 0 else "BUY"
-        quantity = abs(amount)
-        result = self._signed_request("POST", "/fapi/v1/order", {
-            "symbol": symbol,
-            "side": side,
-            "type": "MARKET",
-            "quantity": str(quantity),
-            "reduceOnly": "true",
-            "newOrderRespType": "RESULT",
-        })
-        # Confirm position state after close request.
+        side, quantity = ("SELL" if amount > 0 else "BUY"), abs(amount)
+        result = self._signed_request("POST", "/fapi/v1/order", {"symbol": symbol, "side": side, "type": "MARKET", "quantity": str(quantity), "reduceOnly": "true", "newOrderRespType": "RESULT"})
         time.sleep(0.5)
         confirm = self.get_open_position(symbol)
-        return {
-            "close_order": result,
-            "confirmed_flat": confirm is None,
-            "remaining_position": confirm,
-        }
+        return {"close_order": result, "confirmed_flat": confirm is None, "remaining_position": confirm}
