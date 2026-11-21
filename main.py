@@ -332,6 +332,12 @@ def execute_for_account(signal, account_number, pre=None):
 
 
 
+# Lifecycle monitor globals (required before load/startup)
+LIFECYCLE_LOCK = threading.Lock()
+LIFECYCLE_SNAPSHOT = {}
+MONITOR_INTERVAL = max(5, int(os.getenv("LIFECYCLE_MONITOR_INTERVAL", "10")))
+MONITOR_STARTED = False
+
 # FINAL PATCH: lifecycle reconciliation and closure-event journaling
 # State is written to LIFECYCLE_STATE_FILE (default /tmp on Render).
 # /tmp is ephemeral on Render unless a persistent disk is mounted.
