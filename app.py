@@ -2,9 +2,8 @@
 
 Flow: POST /webhook -> authenticate -> parse -> duplicate check -> queue -> worker executes.
 
-The webhook answers within milliseconds (TradingView drops webhook calls that take
-longer than a few seconds); execution happens on a single background worker so entries
-and closes are always processed one at a time, in arrival order.
+The webhook answers within milliseconds; execution happens on a single background
+worker so entries and closes are processed one at a time, in arrival order.
 """
 import hmac
 import json
@@ -32,14 +31,14 @@ class _Redactor(logging.Filter):
         super().__init__()
         self._secrets = [s for s in secrets if s and len(s) >= 8]
         self._signature = re.compile(r"signature=[0-9a-fA-F]{16,}")
-        self._query_secret = re.compile(r"(secret=)[^&\s\"']+", re.IGNORECASE)
+        self._query_secret = re.compile(r"(secret=)[^&\\s\"']+", re.IGNORECASE)
 
     def filter(self, record):
         message = record.getMessage()
         for secret in self._secrets:
             message = message.replace(secret, "***")
         message = self._signature.sub("signature=***", message)
-        message = self._query_secret.sub(r"\1***", message)
+        message = self._query_secret.sub(r"\\1***", message)
         record.msg, record.args = message, ()
         return True
 
@@ -76,9 +75,28 @@ def _worker() -> None:
 
 
 threading.Thread(target=_worker, name="executor", daemon=True).start()
-threading.Thread(target=executor.warmup, name="warmup", daemon=True).start()
 
 app = Flask(__name__)
+
+# Start warmup lazily on the first app request, rather than during module import.
+# This avoids import-time startup races and keeps readiness checks observable.
+_warmup_lock = threading.Lock()
+_warmup_started = False
+
+
+def _start_warmup_once() -> None:
+    global _warmup_started
+    with _warmup_lock:
+        if _warmup_started:
+            return
+        _warmup_started = True
+        log.info("Warmup trigger: first application request")
+        threading.Thread(target=executor.warmup, name="warmup", daemon=True).start()
+
+
+@app.before_request
+def _ensure_warmup_started():
+    _start_warmup_once()
 
 
 def _authorised(body_secret=None) -> bool:
