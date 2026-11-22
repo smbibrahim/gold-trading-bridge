@@ -1,20 +1,11 @@
 """Parses TradingView alert messages into a normalised Alert.
 
-Supported inputs
-  1. Plain text produced by the Pine strategy's f_entryAlert():
-         🟢 LONG ENTRY
-         Symbol: XAUUSDT.P
-         Side: LONG
-         Leverage: Isolated 20x
-         Quantity: 1
-         Entry price: 3500.12
-         Take Profit: 3530.00
-         Stop Loss: 3480.00
-         ...
-  2. Force-close commands emitted by the strategy: "/close_long" or "/close_short"
-  3. JSON (optional), e.g. {"event":"ENTRY","direction":"LONG","quantity":1,...}
+Supported inputs:
+  1. Plain text ENTRY alerts with Side, Symbol, Quantity, Entry price, TP, SL, Leverage.
+  2. Force-close commands: /close_long or /close_short.
+  3. JSON ENTRY/CLOSE alerts.
 
-The parser only extracts values. It never computes or changes trading parameters.
+This parser extracts and validates values; it does not compute trading parameters.
 """
 import hashlib
 import re
@@ -32,15 +23,15 @@ class AlertError(ValueError):
 
 @dataclass(frozen=True)
 class Alert:
-    event: str                      # ENTRY | CLOSE
-    direction: str                  # LONG | SHORT
+    event: str
+    direction: str
     symbol: Optional[str] = None
     quantity: Optional[Decimal] = None
     entry_price: Optional[Decimal] = None
     stop_loss: Optional[Decimal] = None
     take_profit: Optional[Decimal] = None
     leverage: Optional[int] = None
-    margin_mode: Optional[str] = None       # ISOLATED | CROSSED
+    margin_mode: Optional[str] = None
     estimated_margin: Optional[Decimal] = None
     exchange: Optional[str] = None
     timeframe: Optional[str] = None
@@ -63,12 +54,16 @@ class Alert:
         return hashlib.sha256(basis.encode("utf-8")).hexdigest()
 
     def public_dict(self) -> dict:
-        return {k: (str(v) if isinstance(v, Decimal) else v) for k, v in self.__dict__.items() if v is not None}
+        return {
+            k: (str(v) if isinstance(v, Decimal) else v)
+            for k, v in self.__dict__.items()
+            if v is not None
+        }
 
 
-_CLOSE_RE = re.compile(r"^\s*/?close[_\s-]?(long|short)\b", re.IGNORECASE)
-_KV_RE = re.compile(r"^\s*([A-Za-z][A-Za-z ]*?)\s*:\s*(.*?)\s*$")
-_LEV_RE = re.compile(r"(isolated|cross(?:ed)?)\s+([0-9]+(?:\.[0-9]+)?)\s*x", re.IGNORECASE)
+_CLOSE_RE = re.compile(r"^\\s*/?close[_\\s-]?(long|short)\\b", re.IGNORECASE)
+_KV_RE = re.compile(r"^\\s*([A-Za-z][A-Za-z ]*?)\\s*:\\s*(.*?)\\s*$")
+_LEV_RE = re.compile(r"(isolated|cross(?:ed)?)\\s+([0-9]+(?:\\.[0-9]+)?)\\s*x", re.IGNORECASE)
 
 
 def normalise_symbol(value: str) -> str:
@@ -82,17 +77,19 @@ def _dec(value, name: str) -> Decimal:
         raise AlertError(f"Missing field: {name}")
     try:
         number = Decimal(text.split()[0])
-    except InvalidOperation:
+    except (InvalidOperation, ValueError):
         raise AlertError(f"Invalid number for {name}: {text!r}") from None
     if not number.is_finite():
         raise AlertError(f"Invalid number for {name}: {text!r}")
+    if number <= 0:
+        raise AlertError(f"{name} must be greater than zero")
     return number
 
 
 def _leverage(value) -> int:
     number = _dec(value, "leverage")
-    if number != number.to_integral_value() or number < 1:
-        raise AlertError(f"leverage must be a whole number >= 1, got {value!r}")
+    if number != number.to_integral_value():
+        raise AlertError(f"leverage must be a whole number, got {value!r}")
     return int(number)
 
 
@@ -112,6 +109,38 @@ def _direction(value) -> str:
     if text in ("SHORT", "SELL"):
         return "SHORT"
     raise AlertError(f"direction must be LONG or SHORT, got {value!r}")
+
+
+def _validate_entry(alert: Alert) -> Alert:
+    """Validate mandatory ENTRY fields and directional protective prices."""
+    if not alert.symbol:
+        raise AlertError("Missing field: symbol")
+    if alert.quantity is None or alert.quantity <= 0:
+        raise AlertError("quantity must be greater than zero")
+    for name, price in (
+        ("entry price", alert.entry_price),
+        ("stop loss", alert.stop_loss),
+        ("take profit", alert.take_profit),
+    ):
+        if price is None or price <= 0:
+            raise AlertError(f"{name} must be greater than zero")
+
+    if alert.direction == "LONG":
+        if not alert.stop_loss < alert.entry_price:
+            raise AlertError("LONG stop loss must be below entry price")
+        if not alert.take_profit > alert.entry_price:
+            raise AlertError("LONG take profit must be above entry price")
+    else:
+        if not alert.stop_loss > alert.entry_price:
+            raise AlertError("SHORT stop loss must be above entry price")
+        if not alert.take_profit < alert.entry_price:
+            raise AlertError("SHORT take profit must be below entry price")
+
+    if alert.leverage is None or alert.leverage < 1:
+        raise AlertError("leverage must be an integer >= 1")
+    if alert.margin_mode not in ("ISOLATED", "CROSSED"):
+        raise AlertError("margin mode must be ISOLATED or CROSSED")
+    return alert
 
 
 def _from_text(raw: str) -> Alert:
@@ -136,7 +165,7 @@ def _from_text(raw: str) -> Alert:
     if fields.get("estimated_margin", "").strip().lower() not in ("", "n/a"):
         estimated_margin = _dec(fields["estimated_margin"], "estimated margin")
 
-    return Alert(
+    alert = Alert(
         event=ENTRY,
         direction=_direction(fields["side"]),
         symbol=normalise_symbol(fields.get("symbol", "")) or None,
@@ -151,6 +180,7 @@ def _from_text(raw: str) -> Alert:
         timeframe=fields.get("timeframe") or None,
         signal_time=fields.get("signal_time") or None,
     )
+    return _validate_entry(alert)
 
 
 def _from_json(obj: dict) -> Alert:
@@ -162,19 +192,18 @@ def _from_json(obj: dict) -> Alert:
 
     event = str(pick("event", "action") or ENTRY).strip().upper()
     force_close = str(pick("force_close") or "").strip().lower() in ("true", "1", "yes")
-    symbol = pick("symbol", "ticker")
-    symbol = normalise_symbol(str(symbol)) if symbol else None
-    direction = _direction(pick("direction", "side"))
+    symbol_value = pick("symbol", "ticker")
+    symbol = normalise_symbol(str(symbol_value)) if symbol_value else None
 
     if event in ("CLOSE", "EXIT", "FORCE_CLOSE") or force_close:
-        return Alert(event=CLOSE, direction=direction, symbol=symbol, signal_id=pick("signal_id", "id"))
+        return Alert(event=CLOSE, direction=_direction(pick("direction", "side")), symbol=symbol, signal_id=pick("signal_id", "id"))
     if event != ENTRY:
         raise AlertError(f"Unsupported event: {event!r}")
 
     margin_mode = pick("margin_mode")
-    return Alert(
+    alert = Alert(
         event=ENTRY,
-        direction=direction,
+        direction=_direction(pick("direction", "side")),
         symbol=symbol,
         quantity=_dec(pick("quantity", "qty"), "quantity"),
         entry_price=_dec(pick("entry_price", "entry"), "entry_price"),
@@ -188,6 +217,7 @@ def _from_json(obj: dict) -> Alert:
         signal_time=pick("timestamp", "signal_time"),
         signal_id=pick("signal_id", "id"),
     )
+    return _validate_entry(alert)
 
 
 def parse_alert(raw: str, body_json: Optional[dict]) -> Tuple[Alert, Optional[str]]:
