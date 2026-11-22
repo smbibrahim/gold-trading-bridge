@@ -1,0 +1,38 @@
+# Render Blueprint. Every value is entered in the Render dashboard (sync: false),
+# so no setting or secret is stored in Git.
+services:
+  - type: web
+    name: tv-binance-bridge
+    runtime: python
+    # A persistent disk and an always-on instance both need a paid plan. Free instances
+    # sleep after inactivity and would miss alerts, so do not use the free plan for this.
+    plan: starter
+    buildCommand: pip install -r requirements.txt
+    # One worker process so the order queue and SQLite record stay consistent.
+    startCommand: gunicorn app:app --workers 1 --threads 4 --bind 0.0.0.0:$PORT --timeout 60
+    healthCheckPath: /health
+    disk:
+      name: bridge-data
+      mountPath: /var/data
+      sizeGB: 1
+    envVars:
+      - {key: BINANCE_API_KEY, sync: false}
+      - {key: BINANCE_API_SECRET, sync: false}
+      - {key: BINANCE_BASE_URL, sync: false}
+      - {key: WEBHOOK_SECRET, sync: false}
+      - {key: TRADE_SYMBOL, sync: false}
+      - {key: DB_PATH, sync: false}
+      - {key: RECV_WINDOW_MS, sync: false}
+      - {key: HTTP_TIMEOUT_SECONDS, sync: false}
+      - {key: ORDER_ID_PREFIX, sync: false}
+      - {key: PROTECTIVE_ORDER_MODE, sync: false}
+      - {key: TRIGGER_WORKING_TYPE, sync: false}
+      - {key: FLATTEN_ON_PROTECTION_FAILURE, sync: false}
+      - {key: CANCEL_STALE_ORDERS_BEFORE_ENTRY, sync: false}
+      - {key: CHECK_AVAILABLE_BALANCE, sync: false}
+      - {key: MAX_ENTRY_DEVIATION_PCT, sync: false}
+      - {key: ORDER_CONFIRM_RETRIES, sync: false}
+      - {key: ORDER_CONFIRM_DELAY_MS, sync: false}
+      - {key: EXCHANGE_INFO_TTL_SECONDS, sync: false}
+      - {key: STATUS_HISTORY_LIMIT, sync: false}
+      - {key: LOG_LEVEL, sync: false}
