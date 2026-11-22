@@ -1,4 +1,3 @@
-
 """Trade execution. Receives validated alerts and executes them on Binance Demo.
 
 The bot never creates trading parameters. Quantity, leverage, margin mode, stop loss and
@@ -60,7 +59,7 @@ class Executor:
         self._lock = threading.Lock()
         self._rules: Optional[Rules] = None
         self._rules_at = 0.0
-        self.symbol_ready: Optional[bool] = None
+        self.symbol_ready: Optional[bool] = None   # None = not checked yet
         self.symbol_note = "not checked yet"
 
     # ------------------------------------------------------------ entry point
@@ -88,11 +87,11 @@ class Executor:
             return result
 
     def warmup(self) -> None:
-        """Startup diagnostic: sync clock and verify symbol. Never raises."""
-        log.info("WARMUP STARTED")
-
+        """Startup validation of Binance connectivity and symbol rules."""
         self.symbol_ready = False
         self.symbol_note = "startup check in progress"
+
+        log.info("WARMUP STARTED")
 
         try:
             log.info("WARMUP: syncing Binance time")
@@ -100,7 +99,10 @@ class Executor:
             log.info("WARMUP: time sync successful")
 
             log.info("WARMUP: checking symbol %s", self.cfg.symbol)
-            self.symbol_rules(force=True)
+            rules = self.symbol_rules(force=True)
+
+            self.symbol_ready = rules.status == "TRADING"
+            self.symbol_note = f"status {rules.status}"
 
             log.info(
                 "WARMUP COMPLETE: ready=%s note=%s",
@@ -110,10 +112,10 @@ class Executor:
 
         except Reject as exc:
             self.symbol_ready = False
-            self.symbol_note = str(exc)
-            log.error("WARMUP REJECT: %s", exc)
+            self.symbol_note = f"startup rejected: {exc.code}"
+            log.error("WARMUP REJECTED: %s", exc)
 
-        except Exception as exc:
+        except Exception as exc:  # noqa: BLE001
             self.symbol_ready = False
             self.symbol_note = f"startup check error: {type(exc).__name__}"
             log.exception("WARMUP ERROR")
@@ -450,9 +452,9 @@ class Executor:
                 if exc.http_status == 404:
                     continue  # endpoint not available on this environment
                 if strict:
-                    raise Reject("STALE_ORDER_CLEANUP_FAILED", f"Could not clear old orders: {exc}")
+                    raise Reject("STALE_ORDER_CLEANUP_FAILED", f"Could not clear old orders: {exc}") from None
                 log.warning("Order cleanup failed: %s", exc)
             except TransportError as exc:
                 if strict:
-                    raise Reject("STALE_ORDER_CLEANUP_FAILED", f"Could not clear old orders: {exc}")
+                    raise Reject("STALE_ORDER_CLEANUP_FAILED", f"Could not clear old orders: {exc}") from None
                 log.warning("Order cleanup failed: %s", exc)
