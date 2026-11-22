@@ -1,3 +1,4 @@
+
 """Trade execution. Receives validated alerts and executes them on Binance Demo.
 
 The bot never creates trading parameters. Quantity, leverage, margin mode, stop loss and
@@ -59,7 +60,7 @@ class Executor:
         self._lock = threading.Lock()
         self._rules: Optional[Rules] = None
         self._rules_at = 0.0
-        self.symbol_ready: Optional[bool] = None   # None = not checked yet
+        self.symbol_ready: Optional[bool] = None
         self.symbol_note = "not checked yet"
 
     # ------------------------------------------------------------ entry point
@@ -87,16 +88,35 @@ class Executor:
             return result
 
     def warmup(self) -> None:
-        """Called once at startup: sync clock and verify the symbol. Never raises."""
+        """Startup diagnostic: sync clock and verify symbol. Never raises."""
+        log.info("WARMUP STARTED")
+
+        self.symbol_ready = False
+        self.symbol_note = "startup check in progress"
+
         try:
+            log.info("WARMUP: syncing Binance time")
             self.client.sync_time()
+            log.info("WARMUP: time sync successful")
+
+            log.info("WARMUP: checking symbol %s", self.cfg.symbol)
             self.symbol_rules(force=True)
+
+            log.info(
+                "WARMUP COMPLETE: ready=%s note=%s",
+                self.symbol_ready,
+                self.symbol_note,
+            )
+
         except Reject as exc:
-            log.error("Startup check failed: %s", exc)
-        except Exception as exc:  # noqa: BLE001
+            self.symbol_ready = False
+            self.symbol_note = str(exc)
+            log.error("WARMUP REJECT: %s", exc)
+
+        except Exception as exc:
             self.symbol_ready = False
             self.symbol_note = f"startup check error: {type(exc).__name__}"
-            log.error("Startup check error: %s", type(exc).__name__)
+            log.exception("WARMUP ERROR")
 
     # --------------------------------------------------------- exchange rules
     def symbol_rules(self, force: bool = False) -> Rules:
@@ -430,9 +450,9 @@ class Executor:
                 if exc.http_status == 404:
                     continue  # endpoint not available on this environment
                 if strict:
-                    raise Reject("STALE_ORDER_CLEANUP_FAILED", f"Could not clear old orders: {exc}") from None
+                    raise Reject("STALE_ORDER_CLEANUP_FAILED", f"Could not clear old orders: {exc}")
                 log.warning("Order cleanup failed: %s", exc)
             except TransportError as exc:
                 if strict:
-                    raise Reject("STALE_ORDER_CLEANUP_FAILED", f"Could not clear old orders: {exc}") from None
+                    raise Reject("STALE_ORDER_CLEANUP_FAILED", f"Could not clear old orders: {exc}")
                 log.warning("Order cleanup failed: %s", exc)
