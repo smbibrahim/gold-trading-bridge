@@ -61,9 +61,9 @@ class Alert:
         }
 
 
-_CLOSE_RE = re.compile(r"^\\s*/?close[_\\s-]?(long|short)\\b", re.IGNORECASE)
-_KV_RE = re.compile(r"^\\s*([A-Za-z][A-Za-z ]*?)\\s*:\\s*(.*?)\\s*$")
-_LEV_RE = re.compile(r"(isolated|cross(?:ed)?)\\s+([0-9]+(?:\\.[0-9]+)?)\\s*x", re.IGNORECASE)
+_CLOSE_RE = re.compile(r"^\s*/?close[_\s-]?(long|short)\b", re.IGNORECASE)
+_KV_RE = re.compile(r"^\s*([A-Za-z][A-Za-z ]*?)\s*:\s*(.*?)\s*$")
+_LEV_RE = re.compile(r"(isolated|cross(?:ed)?)\s+([0-9]+(?:\.[0-9]+)?)\s*x", re.IGNORECASE)
 
 
 def normalise_symbol(value: str) -> str:
