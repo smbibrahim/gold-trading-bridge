@@ -1,3 +1,4 @@
+
 """TradingView -> Binance Demo bridge (Flask).
 
 Flow: POST /webhook -> authenticate -> parse -> duplicate check -> queue -> worker executes.
@@ -9,6 +10,7 @@ worker so entries and closes are processed one at a time, in arrival order.
 import hmac
 import json
 import logging
+import os
 import queue
 import re
 import threading
@@ -76,7 +78,7 @@ if interrupted:
 
 
 # ---------------------------------------------------------------------
-# Background worker diagnostics
+# Background worker diagnostics and lifecycle
 # ---------------------------------------------------------------------
 
 _worker_state = {
@@ -88,6 +90,8 @@ _worker_state = {
 }
 
 _worker_state_lock = threading.Lock()
+_worker_start_lock = threading.Lock()
+worker_thread = None
 
 
 def _set_worker_state(**updates):
@@ -142,27 +146,48 @@ def _worker() -> None:
                 last_error=type(exc).__name__,
             )
 
-            store.update(
-                key,
-                "FAILED",
-                {
-                    "status": "FAILED",
-                    "code": "WORKER_ERROR",
-                    "message": type(exc).__name__,
-                },
-            )
+            try:
+                store.update(
+                    key,
+                    "FAILED",
+                    {
+                        "status": "FAILED",
+                        "code": "WORKER_ERROR",
+                        "message": type(exc).__name__,
+                    },
+                )
+            except Exception:  # noqa: BLE001
+                log.exception("[%s] FAILED TO UPDATE STORE", key[:8])
 
         finally:
             jobs.task_done()
 
 
-worker_thread = threading.Thread(
-    target=_worker,
-    name="executor",
-    daemon=True,
-)
+def start_executor_worker():
+    """Start the executor thread once, inside the Gunicorn worker process."""
 
-worker_thread.start()
+    global worker_thread
+
+    with _worker_start_lock:
+        if worker_thread is not None and worker_thread.is_alive():
+            log.info("EXECUTOR WORKER ALREADY RUNNING")
+            return
+
+        _set_worker_state(
+            alive=False,
+            state="STARTING",
+            current_key=None,
+        )
+
+        worker_thread = threading.Thread(
+            target=_worker,
+            name="executor",
+            daemon=True,
+        )
+
+        worker_thread.start()
+
+        log.info("EXECUTOR WORKER THREAD LAUNCHED")
 
 
 # ---------------------------------------------------------------------
@@ -172,8 +197,7 @@ worker_thread.start()
 app = Flask(__name__)
 
 
-# Start warmup lazily on the first app request, rather than during module import.
-# This avoids import-time startup races and keeps readiness checks observable.
+# Start warmup lazily on the first app request.
 
 _warmup_lock = threading.Lock()
 _warmup_started = False
@@ -230,7 +254,9 @@ def health():
     with _worker_state_lock:
         worker_info = dict(_worker_state)
 
-    worker_info["alive"] = worker_thread.is_alive()
+    worker_info["alive"] = (
+        worker_thread is not None and worker_thread.is_alive()
+    )
 
     return jsonify(
         status="ok",
@@ -313,7 +339,9 @@ def status():
     with _worker_state_lock:
         worker_info = dict(_worker_state)
 
-    worker_info["alive"] = worker_thread.is_alive()
+    worker_info["alive"] = (
+        worker_thread is not None and worker_thread.is_alive()
+    )
 
     return jsonify(
         symbol_ready=executor.symbol_ready,
